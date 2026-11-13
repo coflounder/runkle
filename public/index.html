@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runkle</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23c2410c'/><circle cx='8' cy='8' r='2.5' fill='white'/></svg>">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>run<span>kle</span></h1>
+    <small id="me"></small>
+  </header>
+
+  <div id="banner" role="alert" hidden></div>
+  <div id="notice" role="status" hidden></div>
+
+  <section aria-labelledby="h-int">
+    <div class="bar">
+      <h2 id="h-int">Integrations</h2>
+      <button class="primary" id="add">Add integration</button>
+    </div>
+    <div class="card" id="integrations" aria-live="polite"><p class="row muted">Loading…</p></div>
+  </section>
+
+  <section aria-labelledby="h-connect">
+    <h2 id="h-connect">Connect an agent</h2>
+    <div class="card pad">
+      <p class="muted">Every integration above is served from this one MCP endpoint. Add it to any agent that speaks streamable HTTP; the agent opens a browser so you can sign in.</p>
+      <div class="copy">
+        <input type="text" id="endpoint" readonly aria-label="MCP endpoint URL">
+        <button data-copy="endpoint">Copy</button>
+      </div>
+      <pre id="snippet"></pre>
+      <label>Code mode
+        <select id="code-mode">
+          <option value="off">Off: agents see every tool directly</option>
+          <option value="opt_in">Opt in: agents add ?codemode=search_and_execute</option>
+          <option value="default_on">On by default: agents can add ?codemode=off</option>
+          <option value="enforced">Always on</option>
+        </select>
+        <small>In code mode an agent gets two tools, search and execute, and writes a short program to chain calls, however many integrations you add.</small>
+      </label>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-admin">
+    <h2 id="h-admin">Let an agent manage runkle</h2>
+    <div class="card pad">
+      <p class="muted">Everything on this page except entering secrets is also available to agents as MCP tools at this address. It is protected by the same Cloudflare Access sign-in as this page.</p>
+      <div class="copy">
+        <input type="text" id="admin-endpoint" readonly aria-label="runkle management MCP URL">
+        <button data-copy="admin-endpoint">Copy</button>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-auth">
+    <h2 id="h-auth">Agent sign-in</h2>
+    <form class="card pad" id="agent-auth">
+      <p class="muted" id="auth-missing" hidden>No Access application was found for this portal, so sign-in settings can't be managed here.</p>
+      <p class="muted">Agents register themselves as OAuth clients with Cloudflare Access, then you approve them in the browser. Choose which clients may register.</p>
+      <label class="check"><input type="checkbox" name="enabled"> Let agents sign in with OAuth</label>
+      <label class="check"><input type="checkbox" name="allow_localhost"> Allow clients that redirect to <code>localhost</code> (most command-line agents)</label>
+      <label class="check"><input type="checkbox" name="allow_loopback"> Allow clients that redirect to <code>127.0.0.1</code></label>
+      <label>Other allowed redirect URIs, one per line
+        <textarea name="allowed_uris" spellcheck="false" placeholder="https://claude.ai/api/mcp/auth_callback"></textarea>
+        <small>Hosted agents need their callback listed here. End a URL with /* to allow everything under it.</small>
+      </label>
+      <div><button class="primary">Save sign-in settings</button></div>
+    </form>
+  </section>
+</main>
+
+<dialog id="dialog" aria-labelledby="h-add">
+  <form id="new">
+    <h2 id="h-add">Add integration</h2>
+    <label>Name <input type="text" name="name" required maxlength="60" placeholder="Linear"></label>
+    <label>Type
+      <select name="kind">
+        <option value="server">Remote MCP server</option>
+        <option value="app">Upload a script</option>
+        <option value="api">HTTP API (OpenAPI, GraphQL, Google Discovery)</option>
+        <option value="skills">Skills</option>
+      </select>
+    </label>
+    <div data-kind="server" class="stack">
+    <label>MCP server URL <input type="url" name="url" pattern="https://.*" placeholder="https://mcp.example.com/mcp"></label>
+    <label>Authentication
+      <select name="auth">
+        <option value="none">None</option>
+        <option value="oauth">OAuth, set up automatically</option>
+        <option value="oauth_manual">OAuth, with my own client</option>
+        <option value="bearer">Access token</option>
+      </select>
+    </label>
+    <div data-for="oauth" hidden><small>Cloudflare registers a client with the server for you. After saving, finish the one-time admin sign-in from the Cloudflare dashboard so tools can sync.</small></div>
+    <div data-for="bearer" class="stack" hidden>
+      <label>Token <input type="password" name="token" autocomplete="new-password"></label>
+      <small>Sent as <code>Authorization: Bearer …</code> for every user. Stored by Cloudflare and never shown again.</small>
+    </div>
+    <div data-for="oauth_manual" class="stack" hidden>
+      <small>For services that won't register clients automatically. Create an OAuth app at the service and give it this redirect URL:<br><code>https://oauth-callbacks.cloudflareaccess.com/cdn-cgi/access/outbound-oauth-callback</code></small>
+      <label>Client ID <input type="text" name="client_id" autocomplete="new-password"></label>
+      <label>Client secret <input type="password" name="client_secret" autocomplete="new-password"></label>
+      <label>Authorization endpoint <input type="url" name="authorization_endpoint" placeholder="https://…/authorize"></label>
+      <label>Token endpoint <input type="url" name="token_endpoint" placeholder="https://…/token"></label>
+      <label>Scopes <input type="text" name="scope" placeholder="space separated, optional"></label>
+    </div>
+    </div>
+    <div data-kind="app" class="stack" hidden>
+      <label>Script <input type="file" name="file" accept=".js,.mjs,text/javascript"></label>
+      <small>One JavaScript module that exports <code>tools</code> and, if you like, skills, schedules, webhooks, pages and workflows. runkle deploys it as its own Worker. See the README for the format.</small>
+      <div class="stack" data-secrets></div>
+      <small>Secrets reach the script as <code>env.NAME</code>. They are stored encrypted by Cloudflare and can be replaced but never read back, here or anywhere else.</small>
+    </div>
+    <div data-kind="api" class="stack" hidden>
+      <label>Format
+        <select name="format">
+          <option value="openapi">OpenAPI 3 document</option>
+          <option value="discovery">Google Discovery document</option>
+          <option value="graphql">GraphQL endpoint</option>
+        </select>
+      </label>
+      <label>URL <input type="url" name="api_url" pattern="https://.*" placeholder="https://api.example.com/openapi.json">
+        <small>Where the document is, or the GraphQL endpoint itself.</small></label>
+      <label>Or upload the document <input type="file" name="spec" accept=".json,.yaml,.yml,application/json"></label>
+      <label>Base URL <input type="url" name="base_url" pattern="https://.*" placeholder="Only if the document doesn't say"></label>
+      <label>Only operations containing <input type="text" name="filter" placeholder="/repos (optional, for very large APIs)"></label>
+      <label>Credential is sent as
+        <select name="api_auth">
+          <option value="none">Nothing: the API is open</option>
+          <option value="bearer">Authorization: Bearer …</option>
+          <option value="header">A header I name</option>
+          <option value="query">A query parameter I name</option>
+        </select>
+      </label>
+      <label>Header or parameter name <input type="text" name="auth_name" placeholder="X-Api-Key" autocomplete="off"></label>
+      <label>API key or token <input type="password" name="api_token" autocomplete="new-password">
+        <small>Shared by everyone who uses this integration. Stored encrypted by Cloudflare and never shown again.</small></label>
+    </div>
+    <div data-kind="skills" class="stack" hidden>
+      <label>Skill files <input type="file" name="skill_files" accept=".md,text/markdown" multiple></label>
+      <small>Markdown files, each starting with front matter that gives a <code>name</code> (lowercase-with-dashes) and a <code>description</code> of when to use it. Agents read them through a <code>skills</code> tool.</small>
+    </div>
+    <p id="form-error" class="error" role="alert" hidden></p>
+    <div class="bar">
+      <button type="button" data-close>Cancel</button>
+      <button class="primary">Add</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="app-dialog" aria-labelledby="h-app">
+  <form id="app-form">
+    <h2 id="h-app">Update script</h2>
+    <label>Replace script <input type="file" name="file" accept=".js,.mjs,text/javascript"></label>
+    <small>Leave empty to keep the current script. Existing secrets and stored data are kept unless you set a secret again below. An HTTP API's credential is the secret <code>API_TOKEN</code>.</small>
+    <div class="stack" data-secrets></div>
+    <p id="app-error" class="error" role="alert" hidden></p>
+    <div class="bar">
+      <button type="button" data-close>Cancel</button>
+      <button class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

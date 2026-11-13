@@ -1,0 +1,253 @@
+# runkle
+
+One MCP endpoint for all your integrations, self-hosted entirely on Cloudflare.
+
+Add remote MCP servers in a small web UI, choose which of their tools agents
+may call, and point any agent at a single URL. Each person signs in to each
+integration with their own account; credentials never reach the agent.
+
+Things that are not MCP servers can be integrations too: an HTTP API described
+by an OpenAPI or Google Discovery document, a GraphQL endpoint, a pack of
+skills, or your own script with storage, schedules, webhooks, pages and
+workflows. Agents can manage all of it through runkle's own MCP tools.
+
+runkle is one Cloudflare Worker and no database. It is a management layer over
+things Cloudflare already runs for you:
+
+- **[MCP server portals](https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/mcp-portals/)**
+  serve the endpoint, hold each user's upstream tokens, filter tools, and log calls.
+- **[Access managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)**
+  lets agents register as OAuth clients and sign users in.
+- **Workers** run each script, API source and skill pack, with secrets held as
+  Worker secrets. Durable Objects give scripts storage, Cron Triggers run their
+  schedules, and Workflows run their workflows.
+
+## What it does
+
+- Add an integration by URL: no auth, an access token, OAuth set up
+  automatically, or OAuth with your own client ID and secret.
+- Add an HTTP API and get one tool per operation (see [HTTP APIs](#http-apis)).
+- Publish skills: written instructions agents can read (see [Skills](#skills)).
+- Upload a script and get its functions as tools, plus storage, schedules,
+  webhooks, pages and workflows (see [Scripts](#scripts)).
+- Allow or block each tool.
+- Re-sync and remove integrations.
+- Choose which agent clients may register (localhost, loopback, listed redirect URIs).
+- Turn on code mode, where agents get `search` and `execute` instead of every tool.
+- Do all of the above from an agent (see [Managing runkle from an agent](#managing-runkle-from-an-agent)).
+
+## What it doesn't
+
+- An HTTP API uses one credential shared by everyone. Per-person sign-in is
+  only for MCP servers.
+- Tools are allowed or blocked. There is no "ask me first".
+- The one-time admin sign-in for automatically registered OAuth servers
+  happens in the Cloudflare dashboard; the API has no way to start it.
+  Integrations that use your own OAuth client don't need it.
+- One portal per deployment.
+- Uploaded scripts are a single module with no npm imports. They can `fetch`
+  and use the Web APIs.
+- No catalog of ready-made apps.
+
+## Scripts
+
+A script is one JavaScript module that exports `tools`:
+
+```js
+export const tools = {
+  recent_activities: {
+    description: "List my most recent Garmin activities",
+    input: { type: "object", properties: { limit: { type: "number" } } }, // JSON Schema
+    async run({ limit = 10 }, env) {
+      const res = await fetch("https://example.com/activities?limit=" + limit, {
+        headers: { Authorization: "Bearer " + env.GARMIN_TOKEN },
+      });
+      return res.json(); // anything JSON-serialisable, or a string
+    },
+  },
+};
+```
+
+Choose **Add integration > Upload a script**, pick the file, and add the
+secrets it reads from `env`. runkle deploys it as a Worker named
+`runkle-app-<name>` on your account and registers it with the portal.
+
+`tools` is one of six things a script can export. All are optional:
+
+```js
+// Instructions agents can read through a `skills` tool.
+export const skills = {
+  weekly_report: { description: "How to write my weekly training report", content: "# Steps\n..." },
+};
+
+// Run on a cron expression (UTC).
+export const schedules = {
+  nightly: { cron: "0 6 * * *", async run(env, ctx) { await ctx.storage.put("synced", Date.now()); } },
+};
+
+// Public at https://runkle-app-<name>.<you>.workers.dev/webhooks/activity
+export const webhooks = {
+  async activity(request, env, ctx) {
+    // Anyone can call this. Check the sender's signature with a secret from env.
+    await ctx.storage.put("last", await request.json());
+    return "ok";
+  },
+};
+
+// At .../pages/dashboard, for people your portal's Access policies allow.
+export const pages = {
+  dashboard: async (request, env, ctx) => "<h1>Last sync: " + (await ctx.storage.get("synced")) + "</h1>",
+};
+
+// Durable multi-step runs on Cloudflare Workflows: each step is retried and remembered.
+export const workflows = {
+  async backfill(step, input, env, ctx) {
+    const ids = await step.do("list", async () => [1, 2, 3]);
+    for (const id of ids) await step.do("fetch " + id, async () => ctx.storage.put("a:" + id, id));
+  },
+};
+```
+
+Every handler gets `env` (the script's secrets) and `ctx`:
+
+| | |
+| --- | --- |
+| `ctx.storage` | `get(key)`, `put(key, value)`, `delete(key)`, `list(prefix)`. Durable, private to the script, kept across updates, deleted with it. |
+| `ctx.workflows` | `start(name, input)` returns a run id; `status(id)` reports on it. |
+
+Tools get it as their third argument: `run(input, env, ctx)`. After an upload
+runkle shows the script's webhook and page addresses.
+
+Cloudflare's free plan allows five cron schedules per account.
+
+Anyone who can open runkle can run code on your Cloudflare account this way.
+Keep the Access policy on the runkle Worker to people you would give that to.
+
+## HTTP APIs
+
+Choose **Add integration > HTTP API** and give the address of an OpenAPI 3 or
+Google Discovery document (JSON or YAML), or upload it. Each operation becomes
+a tool. For a GraphQL endpoint you get two tools, `query` and `schema`.
+
+If the API needs a key, say how it is sent (bearer token, a named header, or a
+named query parameter) and enter it. It is stored as the integration's
+`API_TOKEN` secret and used for every caller. A very large API has to be
+narrowed with the filter field, for example to one path prefix.
+
+## Skills
+
+Choose **Add integration > Skills** and pick one or more Markdown files:
+
+```md
+---
+name: weekly-report
+description: How to write my weekly training report
+---
+# Steps
+...
+```
+
+Agents see a `skills` tool whose description lists each skill, and call it to
+read one. A script can carry skills of its own (see [Scripts](#scripts)).
+
+## Secrets
+
+runkle stores no secrets itself. Everything typed into the UI is passed
+straight to Cloudflare and can be replaced but never read back:
+
+| secret | where it lives |
+| --- | --- |
+| access token for an integration, OAuth client secret | the portal's server record, encrypted by Cloudflare |
+| a script's secrets, an HTTP API's key | secret bindings on that integration's Worker |
+| the token that lets the portal call a script | generated by runkle, set on both sides, never shown or stored |
+| each person's sign-in to an integration | the portal, per user |
+
+In the browser, secret fields are masked and wiped when their dialog closes,
+responses are never cached, and a strict content security policy blocks any
+script that isn't runkle's own. A script only receives its own secrets, and
+only answers requests that carry the portal's token.
+
+Don't paste a secret into a script's source. Use a secret field.
+
+## Managing runkle from an agent
+
+runkle serves its own MCP endpoint at `https://<your runkle hostname>/mcp`
+with tools to list, add, sync and remove integrations, upload and update
+scripts, add HTTP APIs and skills, allow or block tools, and change sign-in
+and code mode settings.
+
+It sits behind the same Access application as the UI. Turn on **Managed
+OAuth** for that application (Zero Trust > Access controls > Applications >
+your runkle app > Advanced settings) so agents can sign in.
+
+No tool accepts a secret, because anything an agent handles passes through
+the model. Instead the agent asks runkle for a link and hands it to you: it
+opens this UI, behind the same sign-in, with the form filled in except for
+the secret values. The agent can see which secret names are set, never the
+values. An agent can upload a script that reads `env.GARMIN_TOKEN`, then it
+sends you to the UI to enter the value. The same goes for an HTTP API's key.
+MCP servers that need an access token or your own OAuth client are added in
+the UI.
+
+## Deploy
+
+You need a Cloudflare account with a domain on it and Zero Trust set up with
+an identity provider.
+
+1. **Create the portal.** In the dashboard, go to Zero Trust > Access controls >
+   MCP Portals and create a portal on a hostname such as `mcp.example.com`.
+   Creating it there also makes its DNS record and Access application. Add an
+   Access policy for the people who should use it. Note the portal's ID.
+2. **Create an API token** with `MCP Portals Write`,
+   `Access: Apps and Policies Write` and `Workers Scripts Write`. Uploaded
+   scripts are served from your account's `workers.dev` subdomain, so it
+   must be set up.
+3. **Configure and deploy.**
+
+   ```sh
+   npm install
+   # set ACCOUNT_ID and PORTAL_ID in wrangler.jsonc
+   npx wrangler secret put CLOUDFLARE_API_TOKEN
+   npm run deploy
+   ```
+4. **Put the Worker behind Access.** In the Worker's Settings > Domains &
+   Routes, enable Cloudflare Access (or add a self-hosted Access application
+   for its hostname) and allow only your admins. Copy the team domain
+   (`<team>.cloudflareaccess.com`) and the application's AUD tag into
+   `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` in `wrangler.jsonc`, then deploy again.
+
+### Deploy from a fork with GitHub Actions
+
+Fork the repository and enable Actions on the fork. Under Settings > Secrets
+and variables > Actions, add the secret `CLOUDFLARE_API_TOKEN` (the token from
+step 2) and the variables `CLOUDFLARE_ACCOUNT_ID`, `PORTAL_ID`,
+`ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. Every push to `main` then runs the
+tests and deploys. Without `CLOUDFLARE_ACCOUNT_ID` the deploy is skipped, so
+the fork needs no changes of its own.
+
+Until step 4 is done, every API request is refused. Anyone the Worker's
+Access policy lets in can add and remove integrations, so keep it to admins.
+
+## Development
+
+```sh
+npm test             # Node 22.18+
+npm run typecheck
+
+# run the UI against an in-memory fake of the Cloudflare API
+printf 'AUTH_DISABLED=true\nCLOUDFLARE_API_TOKEN=test-token\nACCOUNT_ID=acct\nPORTAL_ID=main\nCF_API_BASE=http://localhost:8799\n' > .dev.vars
+node test/fake-cloudflare.ts &
+npm run dev
+```
+
+`AUTH_DISABLED` skips the Access check. It belongs in `.dev.vars` only.
+
+## Status
+
+Built from Cloudflare's published API reference and tested against a fake of
+that API. It has not yet been exercised against a live account; expect rough
+edges and please report them.
+
+## License
+
+[MIT](LICENSE)

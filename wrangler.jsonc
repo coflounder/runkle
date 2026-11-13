@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "runkle",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "observability": { "enabled": true },
+  "assets": { "directory": "./public", "run_worker_first": ["/api/*", "/mcp"] },
+  "vars": {
+    // Cloudflare account that owns the portal.
+    "ACCOUNT_ID": "",
+    // ID of the MCP server portal runkle manages.
+    "PORTAL_ID": "",
+    // Access protecting this Worker: <team>.cloudflareaccess.com and the application's AUD tag.
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": ""
+  }
+  // Secret: wrangler secret put CLOUDFLARE_API_TOKEN
+}

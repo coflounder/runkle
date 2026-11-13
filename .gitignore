@@ -1,0 +1,7 @@
+node_modules
+.wrangler
+.dev.vars
+
+# Local working notes and editor settings
+replica/
+.claude/
