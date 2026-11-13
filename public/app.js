@@ -106,7 +106,7 @@ function integrationRow(i, open) {
     : [h("small", {}, i.auth_type === "oauth"
         ? (i.auth_mode === "manual"
             ? "Tools appear after the first person signs in to this integration from their agent."
-            : "No tools yet. Finish the admin sign-in for this server in the Cloudflare dashboard, then sync.")
+            : "No tools yet. Open Admin sign-in, go to the MCP servers tab, select the three dots beside this server and choose Re-authenticate server. Then sync here.")
         : "No tools found yet. Try a sync.")];
 
   const sync = h("button", { textContent: "Sync tools" });
