@@ -174,13 +174,24 @@ export function serverLink(ui: string, input: { name?: string; url?: string; aut
 const appDeps = (env: Env): Deps => ({
   exists: async (id) => (await getPortal(env)).servers?.some((s: any) => s.id === id) ?? false,
   register: (server) => registerServer(env, server),
+  // Access on workers.dev can only finish its login for an app that covers the
+  // whole hostname, so the gate does, and a second app re-opens the paths that
+  // do their own authentication. Opened first, so the portal is never shut out.
   async pagesAud(id, host) {
     const [portal, apps] = await Promise.all([getPortal(env), accessApps(env)]);
-    const domain = `${host}/pages`;
-    const app =
-      apps.find((a) => a.type === "self_hosted" && a.domain === domain) ??
-      (await cf(env, "POST", "/access/apps", { name: `${id} pages`, type: "self_hosted", domain, policies: portalPolicies(apps, portal) }));
-    return app.aud;
+    const find = (domain: string) => apps.find((a) => a.type === "self_hosted" && a.domain === domain);
+    const open = ["mcp", "webhooks", "manifest"].map((area) => `${host}/${area}`);
+    if (!find(open[0]))
+      await cf(env, "POST", "/access/apps", {
+        name: `${id} public paths`,
+        type: "self_hosted",
+        domain: open[0],
+        destinations: open.map((uri) => ({ type: "public", uri })),
+        policies: [{ name: "Everyone", decision: "bypass", include: [{ everyone: {} }] }],
+      });
+    const gate =
+      find(host) ?? (await cf(env, "POST", "/access/apps", { name: `${id} pages`, type: "self_hosted", domain: host, policies: portalPolicies(apps, portal) }));
+    return gate.aud;
   },
 });
 

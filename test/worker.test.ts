@@ -210,8 +210,10 @@ test("an app's storage, skills, schedules, webhooks, pages and workflows", async
   const script = () => fake.scripts.get("runkle-app-rich")!;
   assert.deepEqual(script().schedules, [{ cron: "0 6 * * *" }]);
   assert.deepEqual(fake.workflows.get("runkle-app-rich"), { class_name: "Flow", script_name: "runkle-app-rich" });
-  const gate = [...fake.apps.values()].find((a) => a.type === "self_hosted");
-  assert.equal(gate.domain, "runkle-app-rich.acme.workers.dev/pages");
+  const [open, gate] = [...fake.apps.values()].filter((a) => a.type === "self_hosted");
+  assert.deepEqual(open.destinations.map((d: any) => d.uri), ["mcp", "webhooks", "manifest"].map((area) => `runkle-app-rich.acme.workers.dev/${area}`));
+  assert.equal(open.policies[0].decision, "bypass");
+  assert.equal(gate.domain, "runkle-app-rich.acme.workers.dev");
   assert.deepEqual(gate.policies, [{ id: "pol-1", precedence: 1 }], "pages get the portal's Access policies");
   assert.equal(script().secrets.RUNKLE_PAGES_AUD, gate.aud);
 
