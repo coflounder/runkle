@@ -88,6 +88,8 @@ function createServer(env: Env, ui: string) {
         filter: z.string().optional().describe("Keep only operations whose name or path contains this text. Needed for very large APIs."),
         auth: z.enum(["none", "bearer", "header", "query"]),
         auth_name: z.string().optional().describe("Header or query parameter name, for auth header or query"),
+        secret_headers: z.record(z.string(), z.string()).optional().describe("For APIs that need more than one credential: header name -> name of the secret that fills it, e.g. {\"x-api-key\": \"API_KEY\"}. Names only; the user sets the values through request_credentials."),
+        read_only: z.boolean().optional().describe("Import only GET operations"),
       },
     },
     (input) => run(() => ops.newSource(env, input)),

@@ -134,6 +134,12 @@ named query parameter) and enter it. It is stored as the integration's
 `API_TOKEN` secret and used for every caller. A very large API has to be
 narrowed with the filter field, for example to one path prefix.
 
+Two more options exist only for agents, on the `add_api_source` tool:
+`read_only` imports just the GET operations, and `secret_headers` covers an
+API that needs several credentials by naming a secret for each header (for
+example `{"x-api-key": "API_KEY"}`). You then set those secrets under
+**Update script or secrets**, or through a link from `request_credentials`.
+
 ## Skills
 
 Choose **Add integration > Skills** and pick one or more Markdown files:

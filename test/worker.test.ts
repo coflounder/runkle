@@ -306,20 +306,34 @@ test("OpenAPI, Google Discovery and GraphQL sources become tools", async (t) => 
   assert.equal(sent[2].url, "https://api.example.com/drive/v3/files/a/b?key=g");
   assert.equal(sent[2].method, "PATCH");
 
+  const wide = Object.fromEntries(Array.from({ length: 800 }, (_, i) => [`field${i}`, { type: "string", description: "x".repeat(20) }]));
+  const big = JSON.stringify({ openapi: "3.0.0", servers: [{ url: "https://api.example.com" }], paths: { "/big": { post: { operationId: "big", requestBody: { content: { "application/json": { schema: { type: "object", properties: wide } } } } } } } });
+  await call("POST", "/api/sources", { name: "Big", kind: "openapi", spec: big, auth: "none" });
+  assert.ok(!(await rpc(fake, "runkle-app-big", "tools/list")).tools[0].inputSchema.properties.body.properties, "an oversized body schema is left open");
+
+  // An API that needs several credentials names a secret per header; read_only keeps only the GETs.
+  const multi = await call("POST", "/api/sources", { name: "Multi", kind: "openapi", spec: OPENAPI, auth: "none", read_only: true, secret_headers: { "x-api-key": "API_KEY", "cf-access-client-id": "CLIENT_ID" } });
+  assert.deepEqual(((await multi.json()) as any).tools, ["getPet"]);
+  assert.match((await callTool(fake, "runkle-app-multi", "getPet", { petId: "1" })).text, /API_KEY secret/);
+  await call("PUT", "/api/apps/multi", { secrets: { API_KEY: "k", CLIENT_ID: "c" } });
+  await callTool(fake, "runkle-app-multi", "getPet", { petId: "1" });
+  assert.deepEqual([sent[3].headers.get("x-api-key"), sent[3].headers.get("cf-access-client-id")], ["k", "c"]);
+
   // Added by an agent, so no credential yet: calls say what is missing instead of going out unauthenticated.
   await call("POST", "/api/sources", { name: "Graph", kind: "graphql", url: "https://api.example.com/graphql", auth: "bearer" });
   assert.deepEqual((await rpc(fake, "runkle-app-graph", "tools/list")).tools.map((x: any) => x.name), ["query", "schema"]);
   const refused = await callTool(fake, "runkle-app-graph", "query", { query: "{ me }" });
   assert.ok(refused.isError && /API_TOKEN/.test(refused.text));
-  assert.equal(sent.length, 3);
+  assert.equal(sent.length, 4);
   await call("PUT", "/api/apps/graph", { secrets: { API_TOKEN: "t" } });
   await callTool(fake, "runkle-app-graph", "query", { query: "{ me }" });
-  assert.equal(sent[3].headers.get("Authorization"), "Bearer t");
-  assert.deepEqual(await sent[3].json(), { query: "{ me }" });
+  assert.equal(sent[4].headers.get("Authorization"), "Bearer t");
+  assert.deepEqual(await sent[4].json(), { query: "{ me }" });
 
   for (const bad of [
     { name: "A", kind: "openapi", spec: "title: nope", auth: "none" },
     { name: "A", kind: "openapi", spec: OPENAPI, auth: "header" },
+    { name: "A", kind: "openapi", spec: OPENAPI, auth: "none", secret_headers: { "x-api-key": "RUNKLE_TOKEN" } },
     { name: "A", kind: "openapi", spec: OPENAPI, auth: "none", filter: "nothing-matches" },
     { name: "A", kind: "openapi", spec: OPENAPI, auth: "none", base_url: "http://insecure.example" },
     { name: "A", kind: "graphql", url: "http://insecure.example", auth: "none" },

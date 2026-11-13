@@ -3,7 +3,7 @@
 // OpenAPI documents, Google Discovery documents, GraphQL endpoints and skills.
 
 import { parse } from "yaml";
-import { httpsUrl, InputError } from "./mapping.ts";
+import { httpsUrl, InputError, secretName } from "./mapping.ts";
 
 type Param = { name: string; in: string; required?: boolean; schema?: object };
 type Op = { name: string; description: string; method: string; path: string; params: { name: string; in: string }[]; body: boolean; input: object };
@@ -19,7 +19,10 @@ function inline(node: any, lookup: (ref: string) => any, seen: string[] = []): a
 
 function operation(id: string, description: unknown, method: string, path: string, params: Param[], body: unknown): Op {
   const properties: Record<string, unknown> = Object.fromEntries(params.map((p) => [p.name, p.schema ?? {}]));
-  if (body) properties.body = body; // ponytail: a parameter that is itself called "body" is shadowed
+  // A body schema too big to be useful in a tool listing is left open; the call still goes through.
+  if (body)
+    properties.body = // ponytail: a parameter that is itself called "body" is shadowed
+      JSON.stringify(body).length > 20_000 ? { type: "object", description: "Request body. Its schema is too large to list here; see the API's documentation." } : body;
   return {
     name: id.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64),
     description: String(description ?? "").slice(0, 300),
@@ -89,6 +92,10 @@ async function send(method, url, headers, body, env) {
     if (auth.type === "header") headers[auth.name] = env.API_TOKEN;
     if (auth.type === "query") url.searchParams.set(auth.name, env.API_TOKEN);
   }
+  for (const [name, secret] of Object.entries(config.secretHeaders)) {
+    if (!env[secret]) throw new Error("This integration is missing a credential. An admin must set its " + secret + " secret in runkle.");
+    headers[name] = env[secret];
+  }
   const res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await res.text();
   if (!res.ok) throw new Error("HTTP " + res.status + ": " + text.slice(0, 2000));
@@ -134,6 +141,13 @@ export async function sourceApp(input: any): Promise<string> {
   if (["header", "query"].includes(auth.type) && !/^[A-Za-z0-9_-]+$/.test(auth.name))
     throw new InputError("Give the name of the header or query parameter that carries the credential");
 
+  // Extra credentials for APIs that need more than one: header name -> name of the secret that fills it.
+  const secretHeaders: Record<string, string> = {};
+  for (const [header, secret] of Object.entries(input.secret_headers ?? {})) {
+    if (!/^[A-Za-z0-9_-]+$/.test(header)) throw new InputError(`"${header}" is not a header name`);
+    secretHeaders[header] = secretName(secret);
+  }
+
   let config: { base?: string; ops: Op[]; graphql?: boolean };
   if (input.kind === "graphql") config = { base: httpsUrl(input.url, "GraphQL endpoint"), ops: [], graphql: true };
   else if (input.kind === "openapi" || input.kind === "discovery") {
@@ -145,18 +159,23 @@ export async function sourceApp(input: any): Promise<string> {
     }
     let doc: unknown;
     try {
-      doc = parse(text); // YAML is a superset of JSON
+      doc = JSON.parse(text); // far cheaper than the YAML parser on a large document
     } catch {
-      throw new InputError("The spec is not valid JSON or YAML");
+      try {
+        doc = parse(text);
+      } catch {
+        throw new InputError("The spec is not valid JSON or YAML");
+      }
     }
     config = input.kind === "openapi" ? openapi(doc, input.url || undefined, input.base_url) : discovery(doc, input.base_url);
     const filter = String(input.filter ?? "").trim().toLowerCase();
     if (filter) config.ops = config.ops.filter((op) => `${op.name} ${op.path}`.toLowerCase().includes(filter));
+    if (input.read_only) config.ops = config.ops.filter((op) => op.method === "GET");
     if (!config.ops.length) throw new InputError("No operations found");
   } else throw new InputError("Pick a format");
 
   config.base = httpsUrl(config.base, "The API's base URL");
-  const source = `const config = ${JSON.stringify({ ...config, auth })};\n${CLIENT}`;
+  const source = `const config = ${JSON.stringify({ ...config, auth, secretHeaders })};\n${CLIENT}`;
   // ponytail: every schema is inlined, so a huge API has to be narrowed with `filter`. Share schemas if that bites.
   if (source.length > 1_000_000)
     throw new InputError(`This API is too large to import whole (${config.ops.length} operations). Narrow it with a filter such as a path prefix.`);
