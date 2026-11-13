@@ -3,6 +3,9 @@
   "name": "runkle",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
+  // Lets runkle fetch an app's /manifest: without it, a Worker fetching another
+  // Worker on the same workers.dev subdomain gets a 404.
+  "compatibility_flags": ["global_fetch_strictly_public"],
   "observability": { "enabled": true },
   "assets": { "directory": "./public", "run_worker_first": ["/api/*", "/mcp"] },
   "vars": {
