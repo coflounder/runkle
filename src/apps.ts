@@ -42,7 +42,8 @@ function upload(env: Env, id: string, source: string, secrets: Record<string, st
 async function configure(env: Env, id: string, host: string, setup: string) {
   let manifest: any;
   for (let attempt = 1; !manifest; attempt++) {
-    const res = await appFetch(env, host, "/manifest", { headers: { Authorization: `Bearer ${setup}` } }).catch(() => null);
+    // No redirects: one would be Cloudflare Access standing in front of the app.
+    const res = await appFetch(env, host, "/manifest", { headers: { Authorization: `Bearer ${setup}` }, redirect: "manual" }).catch(() => null);
     if (res?.ok) manifest = await res.json();
     else if (attempt === 5) throw new UpstreamError(`The script was uploaded but is not answering${res ? ` (HTTP ${res.status})` : ""}`);
     else await sleep(2000);

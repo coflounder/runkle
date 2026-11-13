@@ -65,7 +65,7 @@ script it is the upload itself. No second mechanism exists.
 | storage | a SQLite Durable Object in the app's own Worker (`exports` in the upload) | the upload |
 | schedules | Cron Triggers | PUT `workers/scripts/{name}/schedules` |
 | webhooks | the app's `/webhooks/<name>`, public | nothing |
-| pages | the app's `/pages/<name>` behind a path-scoped `self_hosted` Access app with the portal's policies; the runtime checks `ctx.access.aud` and fails closed | POST `access/apps`, aud stored as a Worker secret |
+| pages | the app's `/pages/<name>` behind a `self_hosted` Access app with the portal's policies. It has to cover the whole hostname (Access on workers.dev cannot finish its login for a path-scoped app), so a second app bypasses Access for `/mcp`, `/webhooks` and `/manifest`. The runtime checks `ctx.access.aud` and fails closed | POST `access/apps` twice, aud stored as a Worker secret |
 | workflows | one Cloudflare Workflow per app that dispatches by name | PUT `workflows/{name}` |
 
 runkle cannot evaluate an uploaded module, so after each upload it asks the
@@ -103,8 +103,6 @@ so the agent can see when the user is done.
   reported and the add is rolled back best-effort.
 - **Nothing lists an app's webhooks and pages later.** They are returned by
   the upload and follow a fixed URL pattern; there is nowhere to keep them.
-- **`ctx.access` for a path-scoped Access app on workers.dev is untested.** If
-  Cloudflare does not populate it there, pages answer 403 rather than open.
-- **Unverified against a live account.** Built from the published API
-  reference; the Access app shapes for `mcp` servers come from Cloudflare's
-  Terraform example.
+- **runkle needs `global_fetch_strictly_public`.** Without that compatibility
+  flag a Worker fetching another Worker on the same workers.dev subdomain gets
+  a 404, so the manifest request fails.
