@@ -36,6 +36,7 @@ Cloudflare only.
 | PUT `/api/portal` | code mode | PUT portal |
 | POST `/api/apps` | deploy an uploaded script as a Worker with its secrets, register it | PUT worker script, POST subdomain, then as POST `/api/integrations` |
 | PUT `/api/apps/:id` | replace a script's source and/or set secrets | PUT worker script or PUT worker secrets |
+| GET, POST `/api/apps/:id/proposal` | read an agent's proposed change to a script; approve or reject it (UI only, no MCP tool) | GET worker versions and deployments, then as PUT `/api/apps/:id` |
 | POST `/api/sources` | generate an app from an OpenAPI or Discovery document or a GraphQL endpoint, then as POST `/api/apps` | (fetches the document), then as above |
 | POST `/api/skills` | generate an app that only carries skills, then as POST `/api/apps` | as above |
 | POST `/mcp` | the operations above as MCP tools, minus anything that carries a secret | as above |
@@ -87,6 +88,25 @@ own UI with a fragment naming the form and its non-secret fields; Access is the
 only gate and nothing is stored. The page validates the fragment and never
 reads a secret from it. `secrets_set` in the state lists secret names per app
 so the agent can see when the user is done.
+
+## Review of script changes
+
+A script's code is handed its secrets, so whoever can change the code can read
+them. An agent's `update_script` on a script that holds secrets is therefore
+not deployed. runkle uploads it as a Worker version without deploying it
+(`POST workers/scripts/{name}/versions`), which is the whole store: the
+proposal is "the newest version is not the deployed one". The person opens the
+review link, reads the diff of the two versions' `app.js`, and approves or
+rejects. Either answer is an ordinary upload (of the proposed or the current
+source), because Cloudflare cannot delete a version and refuses secret edits
+while the newest version is not deployed. The decision names the version that
+was read, so a later proposal cannot use an earlier approval.
+
+Not covered: a script without secrets deploys at once, including one that
+keeps tokens it obtained itself in `ctx.storage`. And the review routes trust
+Access plus a same-origin `Origin` header, which separates a browser from an
+agent that behaves, not from one that holds an Access token and forges the
+header. Agents that reach runkle through the portal never hold that token.
 
 ## The parts that bite
 

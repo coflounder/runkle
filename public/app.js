@@ -113,6 +113,8 @@ function integrationRow(i, open) {
   sync.onclick = () => act(sync, () => api("POST", `/api/integrations/${i.id}/sync`));
   const edit = i.is_app ? h("button", { textContent: "Update script or secrets" }) : null;
   if (edit) edit.onclick = () => openApp(i);
+  const review = i.pending_review ? h("button", { className: "primary", textContent: "Review proposed change" }) : null;
+  if (review) review.onclick = () => openReview(i).catch(showError);
   const remove = h("button", { className: "danger", textContent: "Remove" });
   remove.onclick = () => {
     if (remove.dataset.armed) return act(remove, () => api("DELETE", `/api/integrations/${i.id}`));
@@ -129,7 +131,7 @@ function integrationRow(i, open) {
     i.error ? h("p", { className: "error tools" }, i.error) : null,
     i.secrets_set?.length ? h("p", { className: "muted tools" }, `Secrets set: ${i.secrets_set.join(", ")}`) : null,
     h("div", { className: "tools" }, ...tools),
-    h("div", { className: "actions" }, sync, edit,
+    h("div", { className: "actions" }, review, sync, edit,
       i.auth_type === "oauth" && i.auth_mode !== "manual" ? h("a", { className: "button", href: DASHBOARD, target: "_blank", rel: "noopener", textContent: "Admin sign-in ↗" }) : null,
       remove));
 }
@@ -233,6 +235,55 @@ appForm.onsubmit = (e) =>
     return api("PUT", `/api/apps/${appForm.dataset.id}`, { ...(file && { source: await file.text() }), secrets: appSecrets.values() });
   }).then((made) => made?.id && showDeployed(made));
 
+// ---- Review a change an agent proposed to a script that holds secrets ----
+
+// Line diff by longest common subsequence.
+// ponytail: O(lines squared) memory, fine for scripts of a few thousand lines; swap in Myers if one ever stalls.
+function diffLines(a, b) {
+  const n = a.length, m = b.length, w = m + 1, lcs = new Uint32Array((n + 1) * w);
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--) lcs[i * w + j] = a[i] === b[j] ? lcs[(i + 1) * w + j + 1] + 1 : Math.max(lcs[(i + 1) * w + j], lcs[i * w + j + 1]);
+  const out = [];
+  for (let i = 0, j = 0; i < n || j < m; ) {
+    if (i < n && j < m && a[i] === b[j]) out.push([" ", a[i++]]), j++;
+    else if (j < m && (i === n || lcs[i * w + j + 1] >= lcs[(i + 1) * w + j])) out.push(["+", b[j++]]);
+    else out.push(["-", a[i++]]);
+  }
+  return out;
+}
+
+const reviewForm = $("review-form");
+async function openReview(i) {
+  const p = await api("GET", `/api/apps/${i.id}/proposal`);
+  reviewForm.dataset.id = i.id;
+  reviewForm.dataset.version = p.version;
+  $("h-review").textContent = `Review change to ${i.name}`;
+  $("review-error").hidden = true;
+  // Only changed lines and three lines around each, like a patch.
+  const lines = diffLines(p.current.split("\n"), p.proposed.split("\n"));
+  const near = lines.map((_, k) => lines.slice(Math.max(0, k - 3), k + 4).some(([mark]) => mark !== " "));
+  $("review-diff").replaceChildren(...lines.flatMap(([mark, text], k) =>
+    near[k] ? [h("span", { className: mark === "+" ? "add" : mark === "-" ? "del" : "", textContent: `${mark} ${text}` })]
+    : near[k - 1] || k === 0 ? [h("span", { className: "muted", textContent: "  ⋯" })] : []));
+  if (!near.includes(true)) $("review-diff").textContent = "The proposed source is identical to the deployed one.";
+  $("review-dialog").showModal();
+}
+reviewForm.onsubmit = async (e) => {
+  if (e.submitter.value === "close") return; // method="dialog" closes it
+  e.preventDefault();
+  for (const b of reviewForm.querySelectorAll("button")) b.disabled = true;
+  try {
+    const made = await api("POST", `/api/apps/${reviewForm.dataset.id}/proposal`, { version: reviewForm.dataset.version, approve: e.submitter.value === "approve" });
+    $("review-dialog").close();
+    if (e.submitter.value === "approve" && made.id) showDeployed(made);
+  } catch (error) {
+    $("review-error").textContent = error.message;
+    $("review-error").hidden = false;
+  }
+  for (const b of reviewForm.querySelectorAll("button")) b.disabled = false;
+  await load().catch(() => {});
+};
+
 // A link an agent handed over (see credentialLink and serverLink in src/ops.ts)
 // opens the matching form. It can name fields but never carries a secret, and
 // everything it sets is checked here: the address bar is not a trusted source.
@@ -243,6 +294,10 @@ function openFromLink(s) {
   if (target) {
     openApp(target);
     for (const name of (link.get("names") || "").split(",")) if (/^[A-Z][A-Z0-9_]{0,63}$/.test(name)) appSecrets.add(name);
+  } else if (link.has("review")) {
+    const waiting = s.integrations.find((i) => i.pending_review && i.id === link.get("review"));
+    if (waiting) openReview(waiting).catch(showError);
+    else showError(new Error("Nothing is waiting for review. It may already have been decided."));
   } else if (link.has("add")) {
     $("add").click();
     form.elements.name.value = link.get("name") || "";

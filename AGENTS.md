@@ -41,7 +41,10 @@ go through `toMapping` and `putPortal`.
 
 Secrets: runkle stores none and returns none. Do not log request bodies, add a
 secret to a response, or add an MCP tool parameter that carries one. Only ever
-touch Workers named `runkle-app-*`.
+touch Workers named `runkle-app-*`. An agent must not be able to change the
+code of a script that holds secrets without a person approving it
+(`proposeApp` in `src/apps.ts`): never add an MCP tool that deploys or
+approves such a change.
 
 Anything new that is not an MCP server becomes an app. Do not add a second
 way to serve tools. Bindings and secrets runkle gives an app are named

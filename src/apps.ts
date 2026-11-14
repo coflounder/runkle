@@ -16,12 +16,13 @@ export const isApp = (server: { id: string; hostname?: string }) =>
 
 // Secrets go to Cloudflare as write-only `secret_text` bindings. With `keep`,
 // secrets already on the Worker survive and the ones given here replace theirs.
-function upload(env: Env, id: string, source: string, secrets: Record<string, string>, keep: boolean) {
+// With `pending`, Cloudflare stores the upload as a version and keeps serving the old one.
+function upload(env: Env, id: string, source: string, secrets: Record<string, string>, keep: boolean, pending = false) {
   const form = new FormData();
   const metadata = {
     main_module: "index.js",
     compatibility_date: "2026-11-01",
-    observability: { enabled: true },
+    ...(pending ? { annotations: { "workers/message": "Proposed by an agent, waiting for review in runkle" } } : { observability: { enabled: true } }),
     exports: { Store: { type: "durable-object", state: "created", storage: "sqlite" } },
     bindings: [
       ...Object.entries(secrets).map(([name, text]) => ({ type: "secret_text", name, text })),
@@ -33,7 +34,7 @@ function upload(env: Env, id: string, source: string, secrets: Record<string, st
   form.set("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
   form.set("index.js", new File([RUNTIME], "index.js", { type: "application/javascript+module" }));
   form.set("app.js", new File([source], "app.js", { type: "application/javascript+module" }));
-  return cf(env, "PUT", scriptPath(id), form);
+  return pending ? cf(env, "POST", `${scriptPath(id)}/versions`, form) : cf(env, "PUT", scriptPath(id), form);
 }
 
 // Ask the freshly uploaded app what it exports, then set up its cron triggers
@@ -107,7 +108,62 @@ export async function updateApp(env: Env, server: { id: string; hostname?: strin
   }
   if (!Object.keys(secrets).length) throw new InputError("Nothing to update");
   for (const [name, text] of Object.entries(secrets))
-    await cf(env, "PUT", `${scriptPath(server.id)}/secrets`, { name, text, type: "secret_text" });
+    await cf(env, "PUT", `${scriptPath(server.id)}/secrets`, { name, text, type: "secret_text" }).catch((error) => {
+      // Cloudflare refuses secret edits while the newest version is not the deployed one.
+      throw /isn't currently deployed/.test(error.message) ? new InputError("A script change is waiting for review. Approve or reject it first.") : error;
+    });
+}
+
+// ---- Review: an agent's change to a script that holds secrets ----
+//
+// New code would run with the script's secrets and could hand them to the
+// agent, so it waits for a person. The proposal is a Worker version that was
+// uploaded but not deployed: Cloudflare stores it, and it serves nothing
+// (version preview URLs are off).
+
+async function versions(env: Env, id: string) {
+  const [all, live] = await Promise.all([cf(env, "GET", `${scriptPath(id)}/versions`), cf(env, "GET", `${scriptPath(id)}/deployments`)]);
+  return { latest: all.items[0]?.id as string, deployed: live.deployments[0]?.versions[0]?.version_id as string };
+}
+
+export const pendingReview = async (env: Env, id: string) => {
+  const v = await versions(env, id);
+  return v.latest !== v.deployed;
+};
+
+async function sourceOf(env: Env, id: string, version: string): Promise<string> {
+  const { modules } = await cf(env, "GET", `/workers/workers/${scriptName(id)}/versions/${version}?include=modules`);
+  const bytes = Uint8Array.from(atob(modules.find((m: any) => m.name === "app.js").content_base64), (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+type Server = { id: string; hostname?: string } | undefined;
+
+export async function proposeApp(env: Env, server: Server, input: any, deps: Deps, ui: string) {
+  if (!server || !isApp(server)) throw new InputError("Not an uploaded script");
+  const source = appSource(input.source);
+  if (!(await secretNames(env, server.id)).length) return updateApp(env, server, { source }, deps);
+  await upload(env, server.id, source, {}, true, true);
+  return {
+    waiting_for_review: `${ui}/#${new URLSearchParams({ review: server.id })}`,
+    next: "Not deployed yet: this script holds secrets, so the user must approve the change. Give them this link. list_integrations shows pending_review until they decide.",
+  };
+}
+
+export async function proposal(env: Env, server: Server) {
+  if (!server || !isApp(server)) throw new InputError("Not an uploaded script");
+  const v = await versions(env, server.id);
+  if (v.latest === v.deployed) throw new InputError("Nothing is waiting for review");
+  const [current, proposed] = await Promise.all([sourceOf(env, server.id, v.deployed), sourceOf(env, server.id, v.latest)]);
+  return { version: v.latest, current, proposed };
+}
+
+// `version` is the proposal the person read, so a newer one cannot ride on their approval.
+// Cloudflare cannot delete a version, so rejecting deploys the current source again.
+export async function decide(env: Env, server: Server, input: any, deps: Deps) {
+  const p = await proposal(env, server);
+  if (input.version !== p.version) throw new InputError("The proposal changed after you opened it. Review it again.");
+  return updateApp(env, server, { source: input.approve === true ? p.proposed : p.current }, deps);
 }
 
 // Names only: Cloudflare never gives a secret's value back.

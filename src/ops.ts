@@ -1,6 +1,6 @@
 // Everything runkle can do, independent of how it is asked (web UI or MCP).
 
-import { createApp, deleteApp, isApp, scriptName, secretNames, updateApp, type Deps } from "./apps.ts";
+import { createApp, decide, deleteApp, isApp, pendingReview, proposal, proposeApp, scriptName, secretNames, updateApp, type Deps } from "./apps.ts";
 import { cf, cfRaw, UpstreamError, type Env } from "./cloudflare.ts";
 import { httpsUrl, InputError, redirectUris, required, secretName, setTool, toMapping, type Mapping } from "./mapping.ts";
 import { skillsApp, sourceApp } from "./sources.ts";
@@ -49,6 +49,8 @@ export async function state(env: Env, me: string) {
   const servers: any[] = portal.servers ?? [];
   // Which secrets each app has, by name, so an agent can tell when the user has entered them.
   const secrets = await Promise.all(servers.map((s) => (isApp(s) ? secretNames(env, s.id).catch(() => []) : undefined)));
+  // ponytail: two Cloudflare calls per script on every load; fetch on demand if the list grows slow.
+  const pending = await Promise.all(servers.map((s) => isApp(s) && pendingReview(env, s.id).catch(() => false)));
   return {
     me,
     portal: { name: portal.name, hostname: portal.hostname, code_mode: portal.code_mode },
@@ -60,6 +62,7 @@ export async function state(env: Env, me: string) {
       auth_type: s.auth_type,
       is_app: isApp(s),
       ...(secrets[i] && { secrets_set: secrets[i] }),
+      ...(pending[i] && { pending_review: true }),
       auth_mode: s.auth_config_summary?.auth_mode,
       status: s.status,
       authentication_status: s.authentication_status,
@@ -203,10 +206,12 @@ export const newSource = async (env: Env, input: any) =>
 
 export const newSkills = (env: Env, input: any) => newApp(env, { name: input.name, source: skillsApp(input.skills) });
 
+const server = async (env: Env, id: string) => (await getPortal(env)).servers?.find((s: any) => s.id === id);
+
 export const changeApp = async (env: Env, id: string, input: any) =>
-  updateApp(
-    env,
-    (await getPortal(env)).servers?.find((s: any) => s.id === id),
-    input.skills ? { source: skillsApp(input.skills) } : input,
-    appDeps(env),
-  );
+  updateApp(env, await server(env, id), input.skills ? { source: skillsApp(input.skills) } : input, appDeps(env));
+
+// What an agent may do to a script's source: deploy it, or leave it for review when the script holds secrets.
+export const proposeChange = async (env: Env, ui: string, id: string, source: unknown) => proposeApp(env, await server(env, id), { source }, appDeps(env), ui);
+export const reviewChange = async (env: Env, id: string) => proposal(env, await server(env, id));
+export const decideChange = async (env: Env, id: string, input: any) => decide(env, await server(env, id), input, appDeps(env));

@@ -73,8 +73,11 @@ function createServer(env: Env, ui: string) {
   );
   server.registerTool(
     "update_script",
-    { description: "Replace the source of an uploaded script. Its secrets and stored data are kept.", inputSchema: { id, source: z.string() } },
-    ({ id, source }) => run(() => ops.changeApp(env, id, { source })),
+    {
+      description: "Replace the source of an uploaded script. Its secrets and stored data are kept. If the script holds secrets the change is not deployed: it waits until the user approves it at the link this returns.",
+      inputSchema: { id, source: z.string() },
+    },
+    ({ id, source }) => run(() => ops.proposeChange(env, ui, id, source)),
   );
   server.registerTool(
     "add_api_source",

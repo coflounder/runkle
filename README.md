@@ -175,6 +175,12 @@ only answers requests that carry the portal's token.
 
 Don't paste a secret into a script's source. Use a secret field.
 
+A script's code can read its secrets, so an agent cannot change a script that
+holds any. Its update waits as a proposal: the script row shows **Review
+proposed change**, where you read the diff and approve or reject it. Until
+then the code you last approved keeps running, and the script's secrets cannot
+be edited.
+
 ## Managing runkle from an agent
 
 runkle serves its own MCP endpoint at `https://<your runkle hostname>/mcp`

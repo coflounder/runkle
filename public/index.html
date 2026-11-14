@@ -167,6 +167,20 @@
   </form>
 </dialog>
 
+<dialog id="review-dialog" class="wide" aria-labelledby="h-review">
+  <form id="review-form" method="dialog">
+    <h2 id="h-review">Review change</h2>
+    <small>An agent proposed this change. The script holds secrets, and its code can read them, so nothing is deployed until you approve. Removed lines are marked <code>-</code>, added lines <code>+</code>.</small>
+    <pre id="review-diff" tabindex="0" aria-label="Proposed change"></pre>
+    <p id="review-error" class="error" role="alert" hidden></p>
+    <div class="bar">
+      <button value="close">Decide later</button>
+      <button value="reject" class="danger">Reject</button>
+      <button value="approve" class="primary">Approve and deploy</button>
+    </div>
+  </form>
+</dialog>
+
 <script type="module" src="/app.js"></script>
 </body>
 </html>

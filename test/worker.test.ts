@@ -381,3 +381,46 @@ test("credential links name what to enter and carry no secret", async (t) => {
   assert.deepEqual(JSON.parse(text).secrets_set, ["GARMIN_USER"]);
   assert.ok(!text.includes("jay"));
 });
+
+test("an agent's change to a script that holds secrets waits for a person", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  const { proposeChange } = await import("../src/ops.ts");
+  const live = () => fake.scripts.get("runkle-app-bare")!.modules["app.js"];
+  const bare = async () => ((await (await call("GET", "/api/state")).json()) as any).integrations[0];
+  const decide = (version: string, approve: boolean) => call("POST", "/api/apps/bare/proposal", { version, approve });
+  await call("POST", "/api/apps", { name: "Bare", source: SCRIPT });
+
+  // Without secrets there is nothing to protect: deployed at once.
+  assert.equal(((await proposeChange(env, origin, "bare", SCRIPT + "// v2")) as any).id, "bare");
+  assert.ok(live().endsWith("// v2"));
+
+  await call("PUT", "/api/apps/bare", { secrets: { KEY: "s3cret" } });
+  const held: any = await proposeChange(env, origin, "bare", SCRIPT + "// leak");
+  assert.equal(held.waiting_for_review, "https://runkle.test/#review=bare");
+  assert.ok(live().endsWith("// v2"), "the approved code keeps serving");
+  assert.equal((await bare()).pending_review, true);
+  const blocked = await call("PUT", "/api/apps/bare", { secrets: { KEY: "other" } });
+  assert.equal(blocked.status, 400);
+  assert.match(((await blocked.json()) as any).error, /waiting for review/);
+
+  const seen: any = await (await call("GET", "/api/apps/bare/proposal")).json();
+  assert.ok(seen.current.endsWith("// v2") && seen.proposed.endsWith("// leak"));
+
+  // A proposal made after the person read the first one cannot use their approval.
+  await proposeChange(env, origin, "bare", SCRIPT + "// leak2");
+  assert.equal((await decide(seen.version, true)).status, 400);
+  assert.ok(live().endsWith("// v2"));
+
+  const newest: any = await (await call("GET", "/api/apps/bare/proposal")).json();
+  assert.equal((await decide(newest.version, false)).status, 200);
+  assert.ok(live().endsWith("// v2"), "rejected");
+  assert.equal((await bare()).pending_review, undefined);
+  assert.equal((await call("GET", "/api/apps/bare/proposal")).status, 400);
+
+  await proposeChange(env, origin, "bare", SCRIPT + "// v3");
+  const third: any = await (await call("GET", "/api/apps/bare/proposal")).json();
+  assert.equal((await decide(third.version, true)).status, 200);
+  assert.ok(live().endsWith("// v3"));
+  assert.equal(fake.scripts.get("runkle-app-bare")!.secrets.KEY, "s3cret");
+});

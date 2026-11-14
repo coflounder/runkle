@@ -13,7 +13,7 @@ registerHooks({
   resolve: (specifier, context, next) => (specifier === "cloudflare:workers" ? { url: WORKERS, shortCircuit: true } : next(specifier, context)),
 });
 
-type Script = { modules: Record<string, string>; secrets: Record<string, string>; data: Map<string, unknown>; schedules: { cron: string }[]; mod?: any };
+type Script = { versions: Record<string, string>[]; deployed: number; modules: Record<string, string>; secrets: Record<string, string>; data: Map<string, unknown>; schedules: { cron: string }[]; mod?: any };
 
 export function fakeCloudflare() {
   const servers = new Map<string, any>();
@@ -93,14 +93,24 @@ export function fakeCloudflare() {
       if (!modules["app.js"].includes("export")) return fail(400, "Uncaught SyntaxError: no exports");
       const secrets = Object.fromEntries(meta.bindings.filter((b: any) => b.type === "secret_text").map((b: any) => [b.name, b.text]));
       const old = scripts.get(script);
-      scripts.set(script, { modules, secrets: { ...kept, ...secrets }, data: old?.data ?? new Map(), schedules: old?.schedules ?? [] });
+      const versions = [...(old?.versions ?? []), modules];
+      // A version upload is stored but not deployed: the old code keeps serving.
+      if (path.endsWith("/versions")) return (old!.versions = versions), ok({ id: `v${versions.length - 1}` });
+      scripts.set(script, { versions, deployed: versions.length - 1, modules, secrets: { ...kept, ...secrets }, data: old?.data ?? new Map(), schedules: old?.schedules ?? [] });
       return ok({ id: script });
     }
+    if (script && key.endsWith("/versions")) return ok({ items: scripts.get(script)!.versions.map((_, n) => ({ id: `v${n}` })).reverse() });
+    if (script && key.endsWith("/deployments")) return ok({ deployments: [{ versions: [{ version_id: `v${scripts.get(script)!.deployed}`, percentage: 100 }] }] });
+    if (script && key.endsWith("/secrets") && request.method === "PUT" && scripts.get(script)!.deployed !== scripts.get(script)!.versions.length - 1)
+      return fail(400, "Secret edit failed. The latest version of your Worker isn't currently deployed.");
     if (script && key.endsWith("/subdomain")) return ok({ enabled: true });
     if (script && key === `GET /workers/scripts/${script}/secrets`) return ok(Object.keys(scripts.get(script)!.secrets).map((name) => ({ name, type: "secret_text" })));
     if (script && key.endsWith("/secrets")) return (scripts.get(script)!.secrets[body.name] = body.text), ok({ name: body.name });
     if (script && key.endsWith("/schedules")) return (scripts.get(script)!.schedules = body), ok({ schedules: body });
     if (script && request.method === "DELETE") return scripts.delete(script), ok(null);
+    const [, worker, version] = path.match(/^\/workers\/workers\/(runkle-app-[^/]+)\/versions\/v(\d+)$/) ?? [];
+    if (worker)
+      return ok({ modules: Object.entries(scripts.get(worker)!.versions[Number(version)]).map(([name, text]) => ({ name, content_base64: Buffer.from(text).toString("base64") })) });
     const workflow = path.match(/^\/workflows\/(runkle-app-[^/]+)$/)?.[1];
     if (workflow && request.method === "PUT") return workflows.set(workflow, body), ok(body);
     if (workflow && request.method === "DELETE") return workflows.delete(workflow) ? ok(null) : fail(404, "no such workflow");

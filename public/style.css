@@ -56,6 +56,10 @@ textarea { font-family: var(--mono); font-size: 13px; min-height: 80px; resize: 
 .copy input { font-family: var(--mono); font-size: 13px; }
 pre { margin: 0; padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); overflow-x: auto; font: 13px/1.5 var(--mono); }
 dialog { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); padding: 0; width: min(520px, calc(100vw - 32px)); }
+dialog.wide { width: min(960px, calc(100vw - 32px)); }
+#review-diff { max-height: 60vh; overflow: auto; }
+#review-diff span { display: block; white-space: pre; }
+#review-diff .add { color: var(--good); } #review-diff .del { color: var(--bad); }
 dialog::backdrop { background: rgb(0 0 0 / 0.45); }
 dialog form { padding: 20px; display: grid; gap: 14px; }
 dialog .bar { justify-content: flex-end; }
