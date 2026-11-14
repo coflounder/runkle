@@ -246,7 +246,7 @@ function diffLines(a, b) {
   const out = [];
   for (let i = 0, j = 0; i < n || j < m; ) {
     if (i < n && j < m && a[i] === b[j]) out.push([" ", a[i++]]), j++;
-    else if (j < m && (i === n || lcs[i * w + j + 1] >= lcs[(i + 1) * w + j])) out.push(["+", b[j++]]);
+    else if (j < m && (i === n || lcs[i * w + j + 1] > lcs[(i + 1) * w + j])) out.push(["+", b[j++]]);
     else out.push(["-", a[i++]]);
   }
   return out;

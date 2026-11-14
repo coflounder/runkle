@@ -44,10 +44,12 @@ export class Store extends DurableObject {
   async list(prefix) { return Object.fromEntries(await this.ctx.storage.list(prefix ? { prefix } : {})); }
 }
 
-// What every handler receives: [the app's secrets, { storage, workflows }].
-function parts(env) {
+// What every handler receives: [the app's secrets, { origin, storage, workflows }].
+// origin is the app's own address, known only while answering a request.
+function parts(env, origin) {
   const secrets = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith("RUNKLE_")));
   const ctx = {
+    origin,
     storage: env.RUNKLE_STORE.get(env.RUNKLE_STORE.idFromName("app")),
     workflows: {
       async start(name, input) {
@@ -95,7 +97,7 @@ export default {
   async fetch(request, env, execution) {
     const path = new URL(request.url).pathname;
     const [, area, name] = path.split("/");
-    const [secrets, ctx] = parts(env);
+    const [secrets, ctx] = parts(env, new URL(request.url).origin);
 
     // Webhooks are public: the handler must check the sender's signature itself.
     if (area === "webhooks" && Object.hasOwn(webhooks, name)) return respond(await webhooks[name](request, secrets, ctx), "text/plain");

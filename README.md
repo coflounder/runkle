@@ -113,6 +113,7 @@ Every handler gets `env` (the script's secrets) and `ctx`:
 | | |
 | --- | --- |
 | `ctx.storage` | `get(key)`, `put(key, value)`, `delete(key)`, `list(prefix)`. Durable, private to the script, kept across updates, deleted with it. |
+| `ctx.origin` | The script's own address, in tools, webhooks and pages. A page is at `ctx.origin + "/pages/<name>"`. |
 | `ctx.workflows` | `start(name, input)` returns a run id; `status(id)` reports on it. |
 
 Tools get it as their third argument: `run(input, env, ctx)`. After an upload

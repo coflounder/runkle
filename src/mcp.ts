@@ -28,6 +28,7 @@ export const workflows = { name: async (step, input, env, ctx) => step.do("first
 
 env holds the script's secrets. ctx.storage has get(key), put(key, value), delete(key) and list(prefix), all async and durable.
 ctx.workflows has start(name, input), which returns an id, and status(id).
+ctx.origin is the script's own address inside tools, webhooks and pages: a page is at ctx.origin + "/pages/<name>".
 It runs as a Cloudflare Worker: fetch and Web APIs are available, npm imports are not.`;
 
 function createServer(env: Env, ui: string) {

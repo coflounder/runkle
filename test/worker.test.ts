@@ -189,7 +189,7 @@ const RICH = `export const tools = {
 export const skills = { triage: { description: "How to triage", content: "# Triage" } };
 export const schedules = { nightly: { cron: "0 6 * * *", async run(env, ctx) { await ctx.storage.put("ran", env.KEY); } } };
 export const webhooks = { ping: async (request) => ({ got: await request.text() }) };
-export const pages = { home: async (request, env, ctx) => "<h1>" + (await ctx.storage.get("ran")) + "</h1>" };
+export const pages = { home: async (request, env, ctx) => "<h1>" + (await ctx.storage.get("ran")) + "</h1>" + ctx.origin };
 export const workflows = { double: (step, input) => step.do("x2", async () => input * 2) };`;
 
 test("an app's storage, skills, schedules, webhooks, pages and workflows", async (t) => {
@@ -229,7 +229,7 @@ test("an app's storage, skills, schedules, webhooks, pages and workflows", async
   assert.equal((await page()).status, 403, "pages are closed without Cloudflare Access");
   assert.equal((await page({ aud: "someone-else" })).status, 403);
   const shown = await page({ aud: gate.aud });
-  assert.equal(await shown.text(), "<h1>k</h1>", "the schedule ran with the app's secret and wrote to storage");
+  assert.equal(await shown.text(), "<h1>k</h1>" + host, "the schedule ran with the app's secret and wrote to storage; the page knows its own address");
   assert.match(shown.headers.get("Content-Type")!, /text\/html/);
   const hook = await worker.fetch(new Request(`${host}/webhooks/ping`, { method: "POST", body: "hi" }), appEnv, {});
   assert.deepEqual(await hook.json(), { got: "hi" }, "webhooks need no token");
