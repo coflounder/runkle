@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createVerify, generateKeyPairSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import type { Env } from "../src/cloudflare.ts";
@@ -767,4 +768,69 @@ test("runkle's own MCP server tells agents how to use the portal and what an add
   const out = JSON.parse(added.content[0].text);
   assert.equal(out.id, "playbooks");
   assert.match(out.next_steps, /reconnects this portal's connector.*fresh session.*update_api_source or update_script/);
+});
+
+test("GitHub: acts as an App, and merges to main, tags, workflow runs and new repositories ask first", async (t) => {
+  const fake = fakeCloudflare();
+  const key = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pr = { number: 7, title: "Fix it", user: { login: "bot" }, head: { sha: "a".repeat(40) }, base: { ref: "main", repo: { default_branch: "main" } } };
+  const calls: { method: string; path: string; body: any; auth: string }[] = [];
+  t.mock.method(globalThis, "fetch", async (input: any, init: any) => {
+    const request = new Request(input, init), url = new URL(request.url), auth = request.headers.get("Authorization")!.slice(7);
+    if (url.hostname !== "api.github.com") return fake.handle(request);
+    const body = request.body ? await request.json() : undefined, path = url.pathname + url.search;
+    calls.push({ method: request.method, path, body, auth });
+    const asApp = /installation$|^\/app\//.test(url.pathname);
+    if (asApp) {
+      // Only a token signed by the App's key, naming the App, is accepted.
+      const [head, claims, signature] = auth.split(".");
+      assert.ok(createVerify("RSA-SHA256").update(`${head}.${claims}`).verify(key.publicKey, signature, "base64url"));
+      assert.equal(JSON.parse(Buffer.from(claims, "base64url").toString()).iss, "123");
+    } else assert.match(auth, /^ghs_/);
+    const at = `${request.method} ${url.pathname}`;
+    if (at === "GET /repos/acme/site/installation" || at === "GET /orgs/acme/installation") return Response.json({ id: 9 });
+    if (at === "GET /repos/acme/other/installation") return Response.json({ message: "Not Found" }, { status: 404 });
+    if (at === "GET /app/installations") return Response.json([{ id: 9 }]);
+    if (at === "POST /app/installations/9/access_tokens") return Response.json({ token: "ghs_" + ((body as any)?.repositories?.[0] ?? "all") });
+    if (at === "GET /installation/repositories") return Response.json({ repositories: [{ full_name: "acme/site", private: true, default_branch: "main" }] });
+    if (at === "GET /repos/acme/site/pulls/7") return Response.json(pr);
+    if (at === `GET /repos/acme/site/commits/${pr.head.sha}/check-runs`) return Response.json({ check_runs: [{ conclusion: "success" }, { conclusion: "failure" }] });
+    if (at === "PUT /repos/acme/site/pulls/7/merge") return Response.json({ merged: true, sha: "m1" });
+    if (at === "POST /repos/acme/site/pulls") return Response.json({ number: 8, html_url: "https://github.com/acme/site/pull/8" });
+    if (at === "POST /repos/acme/site/git/refs") return Response.json({ ref: (body as any).ref });
+    if (at === "POST /repos/acme/site/actions/workflows/deploy.yml/dispatches") return new Response(null, { status: 204 });
+    if (at === "POST /orgs/acme/repos") return Response.json({ full_name: "acme/" + (body as any).name, html_url: "https://github.com/acme/new" });
+    if (at === "GET /repos/acme/site/pulls") return Response.json([pr]);
+    throw new Error("unexpected " + at);
+  });
+  // The key as GitHub issues it (PKCS#1), pasted into a one-line field.
+  const pem = (key.privateKey.export({ type: "pkcs1", format: "pem" }) as string).replace(/\n/g, " ");
+  const { made, tool, approved } = await readyMade(fake, "github.js", "GitHub", { GITHUB_APP_ID: "123", GITHUB_PRIVATE_KEY: pem });
+  assert.deepEqual(made.approvals, ["merge_pull_request", "create_tag", "run_workflow", "create_repository"]);
+  const wrote = () => calls.filter((c) => c.method !== "GET" && !c.path.includes("access_tokens")).map((c) => `${c.method} ${c.path}`);
+
+  // Reading and opening a pull request run freely, with a token narrowed to the one repository.
+  assert.deepEqual(await tool("list_repos"), [{ repo: "acme/site", private: true, default_branch: "main" }]);
+  assert.equal((await tool("get", { repo: "acme/site", path: "pulls", query: { state: "open" } }))[0].number, 7);
+  assert.deepEqual(calls.at(-1), { method: "GET", path: "/repos/acme/site/pulls?state=open", body: undefined, auth: "ghs_site" });
+  assert.match((await tool("get", { repo: "acme/site", path: "../../user" })).error, /\.\./);
+  assert.match((await tool("get", { repo: "acme/other", path: "" })).error, /Not Found/, "a repository the App is not installed on");
+  assert.equal((await tool("create_pull_request", { repo: "acme/site", title: "T", head: "fix", base: "main" })).number, 8);
+
+  // Merging into the default branch: the person sees the commit and its checks, and the merge is pinned to that commit.
+  const merge = { repo: "acme/site", number: 7, sha: pr.head.sha };
+  assert.match((await tool("merge_pull_request", { ...merge, sha: "b".repeat(40) })).error, /Review it again/);
+  const merged = await approved("merge_pull_request", merge, /Merge pull request 7 "Fix it" into main of acme\/site, at commit aaaaaaa by bot \(1 of 2 checks passed\)/);
+  assert.deepEqual(merged, { merged: true, sha: "m1" });
+  assert.deepEqual(calls.filter((c) => c.method === "PUT").at(-1)!.body, { sha: pr.head.sha, merge_method: "squash" });
+  // Into any other branch it is not asked.
+  pr.base.ref = "feature";
+  assert.equal((await tool("merge_pull_request", merge)).merged, true);
+
+  const before = wrote().length;
+  assert.equal((await approved("create_tag", { repo: "acme/site", tag: "v1.2.0", sha: pr.head.sha }, /Push tag v1\.2\.0 to acme\/site, at commit aaaaaaa/)).ref, "refs/tags/v1.2.0");
+  assert.equal((await approved("run_workflow", { repo: "acme/site", workflow: "deploy.yml", ref: "main" }, /Run workflow deploy\.yml on main of acme\/site/)).started, "deploy.yml");
+  assert.equal((await approved("create_repository", { owner: "acme", name: "new" }, /Create the private repository acme\/new/)).repo, "acme/new");
+  assert.equal(calls.filter((c) => c.path === "/orgs/acme/repos").at(-1)!.body.private, true);
+  assert.equal(wrote().length, before + 3, "each ran once, and only after approval");
 });
