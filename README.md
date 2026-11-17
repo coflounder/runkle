@@ -251,6 +251,18 @@ Upload it under **Add integration > Upload a script** with the secrets
 `MINTER_TOKEN` (an account token with `Account API Tokens Write`) and
 `ACCOUNT_ID`.
 
+`scripts/fastmail.js` gives agents your Fastmail mail, contacts and calendar.
+It stands in front of Fastmail's own MCP server, so the tools are Fastmail's:
+the script's `tools` lists them and `call` runs one. Searching, reading,
+listing and drafting an email run at once. Everything else asks first:
+sending, deleting, moving mail, and creating or changing events and contacts.
+A tool Fastmail adds later also asks first, until you add it to `FREE` at the
+top of the script. Upload it with the secret `FASTMAIL_TOKEN`, an API token of
+type MCP from Fastmail's Settings > Privacy & Security > Manage API tokens.
+
+Adding Fastmail's MCP server to the portal directly also works, but then
+nothing asks first: the portal calls it without passing through runkle.
+
 ## Managing runkle from an agent
 
 runkle serves its own MCP endpoint at `https://<your runkle hostname>/mcp`
