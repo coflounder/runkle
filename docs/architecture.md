@@ -35,7 +35,7 @@ Cloudflare only.
 | PUT `/api/agent-auth` | managed OAuth on/off, localhost/loopback, allowed redirect URIs | GET + PUT access app |
 | PUT `/api/portal` | code mode | PUT portal |
 | POST `/api/apps` | deploy an uploaded script as a Worker with its secrets, register it | PUT worker script, POST subdomain, then as POST `/api/integrations` |
-| PUT `/api/apps/:id` | replace a script's source and/or set secrets | PUT worker script or PUT worker secrets |
+| PUT `/api/apps/:id` | replace a script's source, set secrets, and/or set its ask-first list (UI only for the list) | PUT worker script or PUT worker secrets |
 | GET, POST `/api/apps/:id/proposal` | read an agent's proposed change to a script; approve or reject it (UI only, no MCP tool) | GET worker versions and deployments, then as PUT `/api/apps/:id` |
 | POST `/api/sources` | generate an app from an OpenAPI or Discovery document or a GraphQL endpoint, then as POST `/api/apps` | (fetches the document), then as above |
 | POST `/api/skills` | generate an app that only carries skills, then as POST `/api/apps` | as above |
@@ -107,6 +107,41 @@ keeps tokens it obtained itself in `ctx.storage`. And the review routes trust
 Access plus a same-origin `Origin` header, which separates a browser from an
 agent that behaves, not from one that holds an Access token and forges the
 header. Agents that reach runkle through the portal never hold that token.
+
+## Approvals
+
+A tool call that needs a person is stopped in the app's own runtime
+(`gate` in `src/app-runtime.ts`), because that is the one place every call to
+an app passes through. Two things make a tool ask: the person's list, a
+`RUNKLE_ASK` plain-text binding on the app's Worker (set at creation or from
+the UI, read back from the Worker's settings), and an `approval` on the tool
+in the script, which may be a function of the call.
+
+| step | where |
+| --- | --- |
+| the call arrives | the request is stored under the SHA-256 of tool name and canonical arguments, in a second instance of the app's Durable Object that the app's code is never handed |
+| the person is told | the runtime POSTs to `RUNKLE_NOTIFY_URL` (runkle's `NOTIFY_URL`, copied to each app as a secret on upload); the agent gets the same link |
+| the person decides | `/approvals/<id>` on the app's hostname, behind the same Access application as its pages; a same-origin form POST; the decision and the Access email are appended to a log in that Durable Object |
+| the call resumes | the agent repeats the call; an approved request is deleted as it is used, in one Durable Object step, so it runs once |
+
+Requests and unused approvals lapse after an hour. Nothing blocks while
+waiting: holding a tool call open for minutes does not survive the portal.
+
+runkle itself still stores nothing. It only passes the list and the
+notification address down, and creates the Access applications for any app
+with a gated tool.
+
+Not covered:
+
+- **Remote MCP servers.** The portal calls them directly, so runkle cannot
+  stop a call to one. To gate an operation, serve it from an app.
+- **Apps without secrets.** An agent can replace their code unreviewed, and
+  so rename a tool out of the list. Nothing such an app can do needs a
+  secret, and a script's own `approval` only changes with its code.
+- **The script's own pages** share an origin with the approval page. Their
+  code is the script's code: reviewed if the script holds secrets.
+- **Proposed script changes** keep their own review (a diff, not a call) and
+  do not expire. They notify the same address and log to the version history.
 
 ## The parts that bite
 

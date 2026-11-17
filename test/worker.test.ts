@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import type { Env } from "../src/cloudflare.ts";
 import worker from "../src/index.ts";
@@ -206,6 +207,7 @@ test("an app's storage, skills, schedules, webhooks, pages and workflows", async
     webhooks: [`${host}/webhooks/ping`],
     pages: [`${host}/pages/home`],
     workflows: ["double"],
+    approvals: [],
   });
   const script = () => fake.scripts.get("runkle-app-rich")!;
   assert.deepEqual(script().schedules, [{ cron: "0 6 * * *" }]);
@@ -396,8 +398,9 @@ test("an agent's change to a script that holds secrets waits for a person", asyn
   assert.ok(live().endsWith("// v2"));
 
   await call("PUT", "/api/apps/bare", { secrets: { KEY: "s3cret" } });
-  const held: any = await proposeChange(env, origin, "bare", SCRIPT + "// leak");
+  const held: any = await proposeChange({ ...env, NOTIFY_URL: "https://notify.test/me" }, origin, "bare", SCRIPT + "// leak");
   assert.equal(held.waiting_for_review, "https://runkle.test/#review=bare");
+  assert.deepEqual(fake.notes.map((n) => n.click), ["https://runkle.test/#review=bare"], "the person is told where to review it");
   assert.ok(live().endsWith("// v2"), "the approved code keeps serving");
   assert.equal((await bare()).pending_review, true);
   const blocked = await call("PUT", "/api/apps/bare", { secrets: { KEY: "other" } });
@@ -423,4 +426,179 @@ test("an agent's change to a script that holds secrets waits for a person", asyn
   assert.equal((await decide(third.version, true)).status, 200);
   assert.ok(live().endsWith("// v3"));
   assert.equal(fake.scripts.get("runkle-app-bare")!.secrets.KEY, "s3cret");
+  assert.deepEqual(fake.scripts.get("runkle-app-bare")!.messages.slice(-2), ["Rejected by dev@localhost in runkle", "Approved by dev@localhost in runkle"], "decisions are kept in the version history");
+});
+
+const GATED = `export const tools = {
+  read: { run: () => "read" },
+  keys: { run: async (i, env, ctx) => Object.keys(await ctx.storage.list()) },
+  wipe: { run: (i, env) => "wiped " + i.what + " with " + env.KEY },
+  pay: { approval: (i) => i.amount > 10 && "Pay " + i.amount, run: (i) => "paid " + i.amount },
+};`;
+
+test("a tool that asks first runs once, and only after a person approves in their browser", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  const host = "https://runkle-app-gated.acme.workers.dev";
+  const mine = { ...env, NOTIFY_URL: "https://notify.test/me" };
+  const put = (path: string, method: string, body: unknown) =>
+    worker.fetch(new Request(origin + path, { method, headers: { Origin: origin }, body: JSON.stringify(body) }), mine, {} as ExecutionContext);
+
+  const made: any = await (await put("/api/apps", "POST", { name: "Gated", source: GATED, secrets: { KEY: "k" }, ask_first: ["wi*"] })).json();
+  assert.deepEqual(made.approvals, ["wipe", "pay"], "one from the person's list, one from the script");
+  assert.equal((await put("/api/apps", "POST", { name: "Bad", source: GATED, ask_first: ["no spaces"] })).status, 400);
+  const gate = [...fake.apps.values()].find((a) => a.domain === "runkle-app-gated.acme.workers.dev");
+  const app = await fake.app("runkle-app-gated");
+  const listed = ((await (await call("GET", "/api/state")).json()) as any).integrations[0];
+  assert.deepEqual([listed.ask_first, listed.secrets_set], [["wi*"], ["KEY"]]);
+  const described = Object.fromEntries((await rpc(fake, "runkle-app-gated", "tools/list")).tools.map((x: any) => [x.name, /approval/.test(x.description)]));
+  assert.deepEqual(described, { read: false, keys: false, wipe: true, pay: true });
+
+  const tool = async (name: string, args?: unknown) => {
+    const { text, isError } = await callTool(fake, "runkle-app-gated", name, args);
+    return isError ? { error: text } : text.startsWith("{") ? JSON.parse(text) : text;
+  };
+  const page = (path: string, decision?: string, from = host, access: unknown = { aud: gate.aud }) =>
+    app.worker.fetch(
+      new Request(host + path, decision ? { method: "POST", headers: { Origin: from, "Cf-Access-Authenticated-User-Email": "me@example.com" }, body: new URLSearchParams({ decision }) } : {}),
+      app.env,
+      { access },
+    );
+
+  assert.equal(await tool("read"), "read", "other tools run as before");
+  const asked = await tool("wipe", { what: "db", n: 1 });
+  assert.match(asked.waiting_for_approval, /^https:\/\/runkle-app-gated\.acme\.workers\.dev\/approvals\/[0-9a-f]{32}$/);
+  assert.match(asked.next, /sent to their phone/);
+  assert.deepEqual(fake.notes.map((n) => [n.title, n.click]), [["Approve wipe?", asked.waiting_for_approval]]);
+  const path = new URL(asked.waiting_for_approval).pathname;
+  assert.equal((await tool("wipe", { n: 1, what: "db" })).waiting_for_approval, asked.waiting_for_approval, "asking again does not start over");
+  assert.equal(fake.notes.length, 1, "or notify twice");
+  assert.equal(await tool("keys"), "[]", "the script's own storage cannot see or forge approvals");
+
+  assert.equal((await page(path, undefined, host, null)).status, 403, "closed without Cloudflare Access");
+  assert.match(await (await page(path)).text(), /Approve this\?.*wipe.*&#34;db&#34;/s);
+  assert.equal((await page(path, "approve", "https://evil.test")).status, 403, "another site cannot decide");
+  assert.ok((await tool("wipe", { what: "db", n: 1 })).waiting_for_approval);
+  assert.match(await (await page(path, "approve")).text(), /Approved/);
+  assert.equal((await page(path, "deny")).status, 409, "one decision per request");
+
+  assert.ok((await tool("wipe", { what: "everything", n: 1 })).waiting_for_approval, "the approval covers those arguments only");
+  assert.equal(await tool("wipe", { what: "db", n: 1 }), "wiped db with k");
+  assert.ok((await tool("wipe", { what: "db", n: 1 })).waiting_for_approval, "and one call only");
+
+  // A script decides per call, and says what the person is agreeing to.
+  assert.equal(await tool("pay", { amount: 5 }), "paid 5");
+  const pay = new URL((await tool("pay", { amount: 50 })).waiting_for_approval).pathname;
+  assert.match(await (await page(pay)).text(), /Pay 50/);
+  assert.match(await (await page(pay, "deny")).text(), /Denied/);
+  assert.match((await tool("pay", { amount: 50 })).error, /Denied by me@example\.com/);
+
+  const log = await (await page("/approvals")).text();
+  assert.match(log, /denied by me@example\.com<br>Pay 50.*approved by me@example\.com<br>wipe/s);
+  assert.match(log, /Waiting.*wipe.*Decided/s);
+
+  // Unanswered requests and unused approvals lapse.
+  const later = Date.now() + 2 * 60 * 60 * 1000;
+  t.mock.method(Date, "now", () => later);
+  assert.equal((await page(path)).status, 404);
+  assert.equal((await tool("pay", { amount: 50 })).waiting_for_approval, host + pay, "asked afresh");
+
+  // Only the person changes the list; the secret and the script stay as they were.
+  assert.equal((await put("/api/apps/gated", "PUT", { ask_first: [] })).status, 200);
+  assert.equal(await tool("wipe", { what: "db", n: 1 }), "wiped db with k");
+});
+
+// ---- Ready-made scripts in scripts/ ----
+
+// Uploads one and returns ways to call its tools, approve a waiting call and open its pages as a signed-in person.
+async function readyMade(fake: ReturnType<typeof fakeCloudflare>, file: string, name: string, secrets: Record<string, string>) {
+  const made: any = await (await call("POST", "/api/apps", { name, source: readFileSync(`${import.meta.dirname}/../scripts/${file}`, "utf8"), secrets })).json();
+  const script = `runkle-app-${made.id}`, host = `https://${script}.acme.workers.dev`;
+  const aud = [...fake.apps.values()].find((a) => a.domain === new URL(host).host)?.aud;
+  const app = await fake.app(script);
+  const tool = async (tool: string, args?: unknown) => {
+    const { text, isError } = await callTool(fake, script, tool, args);
+    return isError ? { error: text } : /^[[{]/.test(text) ? JSON.parse(text) : text;
+  };
+  const page = (path: string, form?: Record<string, string>) =>
+    app.worker.fetch(new Request(host + path, form ? { method: "POST", headers: { Origin: host, "Cf-Access-Authenticated-User-Email": "me@example.com" }, body: new URLSearchParams(form) } : {}), app.env, { access: { aud } });
+  // Calls a tool that must ask, checks what the person is shown, approves, and calls again.
+  const approved = async (name: string, args: unknown, shown: RegExp) => {
+    const asked = await tool(name, args);
+    assert.ok(asked.waiting_for_approval, `${name} asks first: ${JSON.stringify(asked)}`);
+    const path = new URL(asked.waiting_for_approval).pathname;
+    assert.match(await (await page(path)).text(), shown);
+    await page(path, { decision: "approve" });
+    return tool(name, args);
+  };
+  return { made, tool, page, approved };
+}
+
+test("Cloudflare Tokens: every mint is approved first and no tool returns a value", async (t) => {
+  const fake = fakeCloudflare();
+  const groups = [["DNS Read", ".zone"], ["DNS Write", ".zone"], ["Workers Scripts Read", ""], ["Workers Scripts Write", ""], ["Account API Tokens Write", ""], ["Billing Read", ""]]
+    .map(([name, zone], i) => ({ id: "g" + i, name, scopes: ["com.cloudflare.api.account" + zone] }));
+  const tokens = new Map<string, any>(), calls: any[] = [];
+  // The minter's own view of Cloudflare: token endpoints, and the secret it delivers with a courier token.
+  t.mock.method(globalThis, "fetch", async (input: any, init: any) => {
+    const request = new Request(input, init), path = new URL(request.url).pathname.replace(/^.*\/accounts\/acct/, ""), auth = request.headers.get("Authorization");
+    if (new URL(request.url).hostname !== "api.cloudflare.com" || auth === "Bearer test-token") return fake.handle(request);
+    const body = request.body ? await request.json() : undefined;
+    calls.push({ method: request.method, path, body, auth });
+    const ok = (result: unknown) => Response.json({ success: true, result });
+    if (path === "/tokens/permission_groups") return ok(groups);
+    if (request.method === "POST" && path === "/tokens") {
+      const made = { id: "t" + (tokens.size + 1), value: "cfat_SECRET" + tokens.size, status: "active", ...(body as any) };
+      return tokens.set(made.id, made), ok(made);
+    }
+    if (request.method === "DELETE") return tokens.delete(path.split("/")[2]), ok({});
+    if (path === "/tokens") return ok([...tokens.values(), { id: "x", name: "someone else's" }]);
+    if (path.startsWith("/tokens/")) return ok(tokens.get(path.split("/")[2]) ?? { name: "someone else's" });
+    if (path.endsWith("/secrets")) return path.includes("broken") ? Response.json({ success: false, errors: [{ message: "no such Worker" }] }, { status: 404 }) : ok({});
+    throw new Error("unexpected " + path);
+  });
+  const { made, tool, page, approved } = await readyMade(fake, "cloudflare-tokens.js", "Cloudflare Tokens", { MINTER_TOKEN: "minter", ACCOUNT_ID: "acct" });
+  assert.deepEqual(made.approvals, ["request"]);
+  const ask = (o: object) => ({ purpose: "ci deploy", minutes: 60, ...o });
+  const leaks = (v: unknown) => JSON.stringify(v).includes("cfat_");
+
+  // The rules are checked before anyone is asked.
+  assert.match((await tool("request", ask({ permissions: ["Account API Tokens Write"] }))).error, /never/);
+  assert.match((await tool("request", ask({ permissions: ["Billing Read"] }))).error, /never/);
+  assert.match((await tool("request", ask({ permissions: ["Nope"] }))).error, /Unknown/);
+  assert.match((await tool("request", ask({ permissions: ["DNS Read"], minutes: 200000 }))).error, /minutes/);
+  assert.match((await tool("request", ask({ permissions: ["DNS Read"], worker: "w" }))).error, /both/);
+  assert.deepEqual(await tool("permissions", { search: "s" }), ["DNS Read", "DNS Write", "Workers Scripts Read", "Workers Scripts Write"]);
+
+  // Short-lived and read-only waits too. Approved, it goes to the Worker with a courier token that is then deleted.
+  const toWorker = ask({ permissions: ["DNS Read", "Workers Scripts Read"], worker: "runkle-app-x", secret: "CF" });
+  assert.ok((await tool("request", toWorker)).waiting_for_approval);
+  assert.equal(tokens.size, 0, "nothing is minted before approval");
+  const sent = await approved("request", toWorker, /ci deploy.*60 minutes.*DNS Read \(every zone\), Workers Scripts Read.*secret CF on Worker runkle-app-x/s);
+  assert.equal(sent.done.to, "runkle-app-x secret CF");
+  assert.ok(!leaks(sent));
+  const put = calls.find((c) => c.path.endsWith("/secrets"));
+  assert.deepEqual([put.body.text, put.auth], ["cfat_SECRET0", "Bearer cfat_SECRET1"]);
+  assert.deepEqual([...tokens.keys()], ["t1"], "the courier is gone");
+  const minted = calls.find((c) => c.method === "POST" && c.path === "/tokens").body;
+  assert.equal(minted.name, "runkle: ci deploy");
+  assert.deepEqual(minted.policies.map((p: any) => [Object.values(p.resources)[0], p.permission_groups]), [["*", [{ id: "g2" }]], [{ "com.cloudflare.api.account.zone.*": "*" }, [{ id: "g0" }]]]);
+
+  // Undeliverable: the new token is deleted, not left unowned.
+  assert.match((await approved("request", ask({ permissions: ["DNS Read"], worker: "runkle-app-broken", secret: "CF" }), /broken/)).error, /no such Worker/);
+  assert.equal(tokens.size, 1);
+
+  // With no Worker to go to, only the person sees it, once, on a page of the script.
+  const shown = await approved("request", ask({ permissions: ["DNS Write"], minutes: 1440 }), /24 hours.*your browser, shown once/s);
+  assert.ok(!leaks(shown) && tokens.size === 1, "still not minted");
+  const path = shown.show_to_user.replace(/^https:\/\/[^/]+/, "");
+  assert.match(await (await page(path)).text(), /Mint and show/);
+  assert.match(await (await page(path, {})).text(), /cfat_SECRET/);
+  assert.equal((await page(path, {})).status, 404, "once");
+
+  const listed = await tool("list");
+  assert.deepEqual([listed.tokens.length, listed.log.length], [2, 2]);
+  assert.ok(!leaks(listed) && !leaks([...fake.scripts.get("runkle-app-cloudflare-tokens")!.data]), "no value is stored or listed");
+  assert.match((await tool("revoke", { id: "x" })).error, /Not a token minted here/);
+  assert.deepEqual(await tool("revoke", { id: "t1" }), { revoked: "t1" });
 });

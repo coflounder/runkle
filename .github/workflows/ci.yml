@@ -32,6 +32,7 @@ jobs:
       PORTAL_ID: ${{ vars.PORTAL_ID }}
       ACCESS_TEAM_DOMAIN: ${{ vars.ACCESS_TEAM_DOMAIN }}
       ACCESS_AUD: ${{ vars.ACCESS_AUD }}
+      NOTIFY_URL: ${{ secrets.NOTIFY_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -47,3 +48,5 @@ jobs:
           --var "ACCESS_AUD:$ACCESS_AUD"
       # runkle calls the Cloudflare API with the same token at run time.
       - run: printf '%s' "$CLOUDFLARE_API_TOKEN" | npx wrangler secret put CLOUDFLARE_API_TOKEN
+      - if: env.NOTIFY_URL != ''
+        run: printf '%s' "$NOTIFY_URL" | npx wrangler secret put NOTIFY_URL

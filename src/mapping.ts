@@ -154,6 +154,13 @@ export function appSource(value: unknown): string {
   return value;
 }
 
+// Tool names a person wants to approve before they run; * matches anything.
+export function askFirst(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 500 || value.some((name) => typeof name !== "string" || !/^[\w.*-]{1,100}$/.test(name)))
+    throw new InputError("ask_first must be a list of tool names; * matches anything");
+  return [...new Set(value as string[])];
+}
+
 export function secretName(name: unknown): string {
   if (typeof name !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(name)) throw new InputError(`Secret name "${name}" must be UPPER_SNAKE_CASE`);
   if (name.startsWith("RUNKLE_")) throw new InputError("Names starting with RUNKLE_ are reserved");

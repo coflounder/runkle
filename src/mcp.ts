@@ -29,6 +29,8 @@ export const workflows = { name: async (step, input, env, ctx) => step.do("first
 env holds the script's secrets. ctx.storage has get(key), put(key, value), delete(key) and list(prefix), all async and durable.
 ctx.workflows has start(name, input), which returns an id, and status(id).
 ctx.origin is the script's own address inside tools, webhooks and pages: a page is at ctx.origin + "/pages/<name>".
+A tool can require the user's approval: add approval: true, or approval: async (input, env, ctx) => "one line saying what will happen" (return nothing to let that call run unasked).
+A call that needs approval returns { waiting_for_approval: link } instead of running; the user approves in their browser and the same call, repeated with the same arguments, then runs once.
 It runs as a Cloudflare Worker: fetch and Web APIs are available, npm imports are not.`;
 
 function createServer(env: Env, ui: string) {
@@ -68,9 +70,9 @@ function createServer(env: Env, ui: string) {
     "upload_script",
     {
       description: `Deploy a script as a new integration. Returns its id and what it exports, with the URLs of its webhooks and pages. Secrets it reads from env must then be set by the user at ${ui}.\n\n${SCRIPT_FORMAT}`,
-      inputSchema: { name: z.string(), source: z.string().describe("The module source") },
+      inputSchema: { name: z.string(), source: z.string().describe("The module source"), ask_first: z.array(z.string()).optional().describe("Tools that must wait for the user's approval each time they are called; * matches anything, e.g. [\"delete_*\"]. Only the user can change this list afterwards.") },
     },
-    ({ name, source }) => run(() => ops.newApp(env, { name, source })),
+    ({ name, source, ask_first }) => run(() => ops.newApp(env, { name, source, ask_first })),
   );
   server.registerTool(
     "update_script",
@@ -94,6 +96,7 @@ function createServer(env: Env, ui: string) {
         auth_name: z.string().optional().describe("Header or query parameter name, for auth header or query"),
         secret_headers: z.record(z.string(), z.string()).optional().describe("For APIs that need more than one credential: header name -> name of the secret that fills it, e.g. {\"x-api-key\": \"API_KEY\"}. Names only; the user sets the values through request_credentials."),
         read_only: z.boolean().optional().describe("Import only GET operations"),
+        ask_first: z.array(z.string()).optional().describe("Tools that must wait for the user's approval each time they are called; * matches anything, e.g. [\"delete_*\"]. Only the user can change this list afterwards."),
       },
     },
     (input) => run(() => ops.newSource(env, input)),

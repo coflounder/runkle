@@ -18,4 +18,5 @@
     "ACCESS_AUD": ""
   }
   // Secret: wrangler secret put CLOUDFLARE_API_TOKEN
+  // Optional secret: wrangler secret put NOTIFY_URL (where "this needs your approval" is sent; see README, Approvals)
 }

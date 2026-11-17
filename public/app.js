@@ -130,6 +130,7 @@ function integrationRow(i, open) {
       h("span", { className: `badge ${status}` }, STATUS[status] || i.status)),
     i.error ? h("p", { className: "error tools" }, i.error) : null,
     i.secrets_set?.length ? h("p", { className: "muted tools" }, `Secrets set: ${i.secrets_set.join(", ")}`) : null,
+    i.ask_first?.length ? h("p", { className: "muted tools" }, `Asks you first: ${i.ask_first.join(", ")}. `, h("a", { href: new URL("/approvals", i.url).href, target: "_blank", rel: "noopener" }, "Approvals and log")) : null,
     h("div", { className: "tools" }, ...tools),
     h("div", { className: "actions" }, review, sync, edit,
       i.auth_type === "oauth" && i.auth_mode !== "manual" ? h("a", { className: "button", href: DASHBOARD, target: "_blank", rel: "noopener", textContent: "Admin sign-in ↗" }) : null,
@@ -225,6 +226,7 @@ const appForm = $("app-form");
 const appSecrets = secretFields(appForm.querySelector("[data-secrets]"));
 function openApp(i) {
   appForm.dataset.id = i.id;
+  appForm.ask_first.value = appForm.dataset.ask = (i.ask_first || []).join("\n");
   $("h-app").textContent = `Update ${i.name}`;
   $("app-dialog").showModal();
 }
@@ -232,7 +234,12 @@ const closeApp = secretDialog($("app-dialog"), appForm, $("app-error"), appSecre
 appForm.onsubmit = (e) =>
   submit(e, $("app-error"), closeApp, async () => {
     const file = appForm.file.files[0];
-    return api("PUT", `/api/apps/${appForm.dataset.id}`, { ...(file && { source: await file.text() }), secrets: appSecrets.values() });
+    const ask = appForm.ask_first.value.trim();
+    return api("PUT", `/api/apps/${appForm.dataset.id}`, {
+      ...(file && { source: await file.text() }),
+      secrets: appSecrets.values(),
+      ...(ask !== appForm.dataset.ask && { ask_first: ask ? ask.split(/\s+/) : [] }),
+    });
   }).then((made) => made?.id && showDeployed(made));
 
 // ---- Review a change an agent proposed to a script that holds secrets ----

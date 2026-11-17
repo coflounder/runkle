@@ -3,8 +3,8 @@
 // any other MCP server. runkle never touches a Worker outside that prefix.
 
 import { RUNTIME } from "./app-runtime.ts";
-import { appFetch, cf, UpstreamError, type Env } from "./cloudflare.ts";
-import { appSecrets, appSource, InputError, required, slug } from "./mapping.ts";
+import { appFetch, cf, notify, UpstreamError, type Env } from "./cloudflare.ts";
+import { appSecrets, appSource, askFirst, InputError, required, slug } from "./mapping.ts";
 
 export const scriptName = (id: string) => `runkle-app-${id}`;
 const scriptPath = (id: string) => `/workers/scripts/${scriptName(id)}`;
@@ -15,21 +15,27 @@ export const isApp = (server: { id: string; hostname?: string }) =>
   Boolean(server.hostname?.startsWith(`https://${scriptName(server.id)}.`));
 
 // Secrets go to Cloudflare as write-only `secret_text` bindings. With `keep`,
-// secrets already on the Worker survive and the ones given here replace theirs.
-// With `pending`, Cloudflare stores the upload as a version and keeps serving the old one.
-function upload(env: Env, id: string, source: string, secrets: Record<string, string>, keep: boolean, pending = false) {
+// secrets and the ask-first list already on the Worker survive and the ones
+// given here replace theirs. With `pending`, Cloudflare stores the upload as a
+// version and keeps serving the old one. `message` is kept in the Worker's
+// version history, which is where decisions on proposals are logged.
+type Upload = { keep?: boolean; pending?: boolean; ask?: string[]; message?: string };
+function upload(env: Env, id: string, source: string, secrets: Record<string, string>, { keep, pending, ask, message }: Upload = {}) {
   const form = new FormData();
+  if (env.NOTIFY_URL) secrets = { ...secrets, RUNKLE_NOTIFY_URL: env.NOTIFY_URL };
   const metadata = {
     main_module: "index.js",
     compatibility_date: "2026-11-01",
-    ...(pending ? { annotations: { "workers/message": "Proposed by an agent, waiting for review in runkle" } } : { observability: { enabled: true } }),
+    ...(!pending && { observability: { enabled: true } }),
+    ...(message && { annotations: { "workers/message": message.slice(0, 100) } }),
     exports: { Store: { type: "durable-object", state: "created", storage: "sqlite" } },
     bindings: [
       ...Object.entries(secrets).map(([name, text]) => ({ type: "secret_text", name, text })),
+      ...(ask ? [{ type: "plain_text", name: "RUNKLE_ASK", text: JSON.stringify(ask) }] : []),
       { type: "durable_object_namespace", name: "RUNKLE_STORE", class_name: "Store" },
       { type: "workflow", name: "RUNKLE_FLOW", workflow_name: scriptName(id), class_name: "Flow" },
     ],
-    ...(keep && { keep_bindings: ["secret_text"] }),
+    ...(keep && { keep_bindings: ["secret_text", "plain_text"] }),
   };
   form.set("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
   form.set("index.js", new File([RUNTIME], "index.js", { type: "application/javascript+module" }));
@@ -58,12 +64,12 @@ async function configure(env: Env, id: string, host: string, setup: string) {
 export type Deps = {
   exists: (id: string) => Promise<boolean>;
   register: (body: Record<string, unknown> & { id: string; name: string; auth_type: string }) => Promise<unknown>;
-  // Puts Cloudflare Access in front of the app's pages and returns its audience tag.
+  // Puts Cloudflare Access in front of the app's pages and approvals and returns its audience tag.
   pagesAud: (id: string, host: string) => Promise<string>;
 };
 
 async function finish(env: Env, id: string, host: string, manifest: any, deps: Deps) {
-  if (manifest.pages.length)
+  if (manifest.pages.length || manifest.approvals.length)
     await cf(env, "PUT", `${scriptPath(id)}/secrets`, { name: "RUNKLE_PAGES_AUD", text: await deps.pagesAud(id, host), type: "secret_text" });
   const urls = (area: string, names: string[]) => names.map((name) => `https://${host}/${area}/${name}`);
   return { id, ...manifest, webhooks: urls("webhooks", manifest.webhooks), pages: urls("pages", manifest.pages) };
@@ -75,13 +81,14 @@ export async function createApp(env: Env, input: any, deps: Deps) {
   if (!id) throw new InputError("Name needs at least one letter or digit");
   const source = appSource(input.source);
   const secrets = appSecrets(input.secrets);
+  const ask = input.ask_first == null ? undefined : askFirst(input.ask_first);
   if (await deps.exists(id)) throw new InputError(`"${id}" already exists`);
 
   // Only the portal may call the app. The token is generated here, handed to
   // Cloudflare on both sides, and never stored or shown by runkle.
   const token = randomKey();
   const setup = randomKey();
-  await upload(env, id, source, { ...secrets, RUNKLE_TOKEN: token, RUNKLE_SETUP: setup }, false);
+  await upload(env, id, source, { ...secrets, RUNKLE_TOKEN: token, RUNKLE_SETUP: setup }, { ask });
   let host: string, manifest: any;
   try {
     await cf(env, "POST", `${scriptPath(id)}/subdomain`, { enabled: true, previews_enabled: false });
@@ -98,10 +105,19 @@ export async function createApp(env: Env, input: any, deps: Deps) {
 export async function updateApp(env: Env, server: { id: string; hostname?: string } | undefined, input: any, deps: Deps) {
   if (!server || !isApp(server)) throw new InputError("Not an uploaded script");
   const secrets = appSecrets(input.secrets);
-  if (input.source != null) {
+  const ask = input.ask_first == null ? undefined : askFirst(input.ask_first);
+  if (input.source != null || ask) {
     const setup = randomKey();
     const host = new URL(server.hostname!).host;
-    await upload(env, server.id, appSource(input.source), { ...secrets, RUNKLE_SETUP: setup }, true);
+    // ponytail: changing only the ask-first list uploads the running source again, because that path is
+    // already proven to keep secrets. PATCH .../settings would avoid the redeploy if this gets slow.
+    let source = input.source;
+    if (source == null) {
+      const v = await versions(env, server.id);
+      if (v.latest !== v.deployed) throw new InputError("A script change is waiting for review. Approve or reject it first.");
+      source = await sourceOf(env, server.id, v.deployed);
+    }
+    await upload(env, server.id, appSource(source), { ...secrets, RUNKLE_SETUP: setup }, { keep: true, ask, message: input.message });
     const manifest = await configure(env, server.id, host, setup);
     await cf(env, "POST", `/access/ai-controls/mcp/servers/${server.id}/sync`);
     return finish(env, server.id, host, manifest, deps);
@@ -143,9 +159,11 @@ export async function proposeApp(env: Env, server: Server, input: any, deps: Dep
   if (!server || !isApp(server)) throw new InputError("Not an uploaded script");
   const source = appSource(input.source);
   if (!(await secretNames(env, server.id)).length) return updateApp(env, server, { source }, deps);
-  await upload(env, server.id, source, {}, true, true);
+  await upload(env, server.id, source, {}, { keep: true, pending: true, message: "Proposed by an agent, waiting for review in runkle" });
+  const link = `${ui}/#${new URLSearchParams({ review: server.id })}`;
+  await notify(env, `Review a change to ${server.id}?`, `An agent proposed a change to the script ${server.id}, which holds secrets.`, link);
   return {
-    waiting_for_review: `${ui}/#${new URLSearchParams({ review: server.id })}`,
+    waiting_for_review: link,
     next: "Not deployed yet: this script holds secrets, so the user must approve the change. Give them this link. list_integrations shows pending_review until they decide.",
   };
 }
@@ -160,15 +178,23 @@ export async function proposal(env: Env, server: Server) {
 
 // `version` is the proposal the person read, so a newer one cannot ride on their approval.
 // Cloudflare cannot delete a version, so rejecting deploys the current source again.
-export async function decide(env: Env, server: Server, input: any, deps: Deps) {
+export async function decide(env: Env, server: Server, input: any, deps: Deps, by: string) {
   const p = await proposal(env, server);
   if (input.version !== p.version) throw new InputError("The proposal changed after you opened it. Review it again.");
-  return updateApp(env, server, { source: input.approve === true ? p.proposed : p.current }, deps);
+  const approve = input.approve === true;
+  return updateApp(env, server, { source: approve ? p.proposed : p.current, message: `${approve ? "Approved" : "Rejected"} by ${by} in runkle` }, deps);
 }
 
-// Names only: Cloudflare never gives a secret's value back.
-export const secretNames = async (env: Env, id: string): Promise<string[]> =>
-  (await cf<{ name: string }[]>(env, "GET", `${scriptPath(id)}/secrets`)).map((s) => s.name).filter((name) => !name.startsWith("RUNKLE_"));
+// What a person has set on an app: its secrets by name (Cloudflare never gives
+// a value back) and the tools they want to be asked about.
+export async function appConfig(env: Env, id: string): Promise<{ secrets: string[]; ask_first: string[] }> {
+  const { bindings } = await cf<{ bindings: { name: string; type: string; text?: string }[] }>(env, "GET", `${scriptPath(id)}/settings`);
+  return {
+    secrets: bindings.filter((b) => b.type === "secret_text" && !b.name.startsWith("RUNKLE_")).map((b) => b.name),
+    ask_first: JSON.parse(bindings.find((b) => b.name === "RUNKLE_ASK")?.text ?? "[]"),
+  };
+}
+export const secretNames = async (env: Env, id: string) => (await appConfig(env, id)).secrets;
 
 export async function deleteApp(env: Env, id: string) {
   await cf(env, "DELETE", `/workflows/${scriptName(id)}`).catch(() => {}); // most apps have none
