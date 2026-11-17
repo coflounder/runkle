@@ -602,3 +602,58 @@ test("Cloudflare Tokens: every mint is approved first and no tool returns a valu
   assert.match((await tool("revoke", { id: "x" })).error, /Not a token minted here/);
   assert.deepEqual(await tool("revoke", { id: "t1" }), { revoked: "t1" });
 });
+
+test("1Password: metadata is free, values and writes ask first, and no tool takes a secret", async (t) => {
+  const fake = fakeCloudflare();
+  const vault = { id: "v".repeat(26), name: "Agents", items: 1 };
+  const item: any = {
+    id: "i".repeat(26), title: "Discogs", category: "LOGIN", tags: ["music"], urls: [{ href: "https://discogs.com" }], updatedAt: "2025-01-01T00:00:00Z",
+    fields: [
+      { id: "username", label: "username", type: "STRING", purpose: "USERNAME", value: "jay" },
+      { id: "password", label: "password", type: "CONCEALED", purpose: "PASSWORD", value: "old-pw" },
+    ],
+  };
+  const writes: any[] = [];
+  let made = 0;
+  t.mock.method(globalThis, "fetch", async (input: any, init: any) => {
+    const request = new Request(input, init), url = new URL(request.url);
+    if (url.hostname !== "op.example.com") return fake.handle(request);
+    assert.equal(request.headers.get("Authorization"), "Bearer connect-token");
+    const body: any = request.body ? await request.json() : undefined;
+    // What Connect does with generate: makes the value itself.
+    const stored = (i: any) => ({ ...i, fields: i.fields.map(({ generate, recipe, ...f }: any) => (generate ? { ...f, id: f.id ?? "f" + ++made, value: `generated-${recipe.length}-${++made}` } : f)) });
+    const at = `${request.method} ${url.pathname}`, filter = url.searchParams.get("filter");
+    if (at === "GET /v1/vaults") return Response.json(filter && filter !== 'name eq "Agents"' ? [] : [vault]);
+    if (at === `GET /v1/vaults/${vault.id}/items`) return Response.json(filter && filter !== 'title eq "Discogs"' ? [] : [{ id: item.id, title: item.title, category: item.category, tags: item.tags, urls: item.urls, updatedAt: item.updatedAt }]);
+    if (at === `GET /v1/vaults/${vault.id}/items/${item.id}`) return Response.json(item);
+    if (at === `PUT /v1/vaults/${vault.id}/items/${item.id}`) return writes.push(body), Object.assign(item, stored(body)), Response.json(item);
+    if (at === `POST /v1/vaults/${vault.id}/items`) return writes.push(body), Response.json({ ...stored(body), id: "n".repeat(26) });
+    return Response.json({ message: "not found" }, { status: 404 });
+  });
+  const { made: app, tool, approved } = await readyMade(fake, "onepassword.js", "1Password", { OP_CONNECT_HOST: "https://op.example.com/", OP_CONNECT_TOKEN: "connect-token" });
+  assert.deepEqual(app.approvals, ["read_secret", "create_item", "generate_field", "copy_field"]);
+  const discogs = { vault: "Agents", item: "Discogs" };
+  const values = /old-pw|generated-/;
+
+  // Free: where things are and what they are called, never what they hold.
+  const free = [await tool("list_vaults"), await tool("list_items", { vault: "Agents", search: "disc" }), await tool("get_item", discogs)];
+  assert.ok(!values.test(JSON.stringify(free)));
+  assert.deepEqual(free[2].fields.map((f: any) => [f.label, f.value, f.filled]), [["username", "jay", true], ["password", undefined, true]]);
+  assert.match((await tool("get_item", { vault: "Personal", item: "Bank" })).error, /No vault called "Personal"/, "only the vaults the token covers");
+
+  // Rotation without anyone seeing a value: generate into a spare field, then copy it over the live one.
+  const staged = await approved("generate_field", { ...discogs, field: "staged password", symbols: false }, /Set &#34;staged password&#34; of item &#34;Discogs&#34; in vault &#34;Agents&#34; with a newly generated value/);
+  assert.ok(!values.test(JSON.stringify(staged)));
+  assert.deepEqual(writes[0].fields[2], { type: "CONCEALED", label: "staged password", generate: true, recipe: { length: 32, characterSets: ["LETTERS", "DIGITS"] } });
+  await approved("copy_field", { ...discogs, from: "staged password", to: "password" }, /Copy &#34;staged password&#34; over &#34;password&#34;.*history/s);
+  assert.match(item.fields[1].value, /^generated-32-/);
+  assert.equal(item.fields[1].value, item.fields[2].value);
+  assert.match((await tool("copy_field", { ...discogs, from: "nope", to: "password" })).error, /No field called "nope"/);
+
+  // Reading a value into the conversation is possible, and always asked.
+  assert.equal(await approved("read_secret", { ...discogs, field: "password" }, /Show the agent the value of &#34;password&#34; from item &#34;Discogs&#34;.*conversation/s), item.fields[1].value);
+
+  const created = await approved("create_item", { vault: "Agents", title: "New API", username: "bot", generate_password: true, length: 20 }, /Create the item &#34;New API&#34; in vault &#34;Agents&#34; with a generated password/);
+  assert.ok(created.id && !values.test(JSON.stringify(created)));
+  assert.equal(writes.length, 3, "each write ran once, after approval");
+});
