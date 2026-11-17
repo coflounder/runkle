@@ -32,6 +32,8 @@ env holds the script's secrets. ctx.storage has get(key), put(key, value), delet
 ctx.workflows has start(name, input), which returns an id, and status(id).
 ctx.origin is the script's own address inside tools, webhooks and pages: a page is at ctx.origin + "/pages/<name>".
 A tool that returns a plain object also returns it as structuredContent. Arguments input.properties does not name are refused unless input sets additionalProperties: true.
+A tool can require the user's approval: add approval: true, or approval: async (input, env, ctx) => "one line saying what will happen" (return nothing to let that call run unasked).
+A call that needs approval returns { waiting_for_approval: link } instead of running; the user approves in their browser and the same call, repeated with the same arguments, then runs once.
 It runs as a Cloudflare Worker: fetch and Web APIs are available, npm imports are not.`;
 
 const USING_THE_PORTAL = `Using this portal: tools of runkle apps (scripts and HTTP APIs) return JSON objects as structuredContent beside the text, so read that instead of parsing the text, and they refuse argument names their input schema does not list. When retrying a write on a server that takes a request or idempotency id, reuse the same id so the write is not done twice. A long write may answer that it is queued: check its status instead of calling it again. For the user's integrations, prefer this portal's tools over other connectors that reach the same service.`;
@@ -78,9 +80,9 @@ function createServer(env: Env, ui: string) {
     "upload_script",
     {
       description: `Deploy a script as a new integration. Returns its id and what it exports, with the URLs of its webhooks and pages. Secrets it reads from env must then be set by the user at ${ui}.\n\n${SCRIPT_FORMAT}`,
-      inputSchema: { name: z.string(), source: z.string().describe("The module source") },
+      inputSchema: { name: z.string(), source: z.string().describe("The module source"), ask_first: z.array(z.string()).optional().describe("Tools that must wait for the user's approval each time they are called; * matches anything, e.g. [\"delete_*\"]. Only the user can change this list afterwards.") },
     },
-    ({ name, source }) => added(() => ops.newApp(env, { name, source })),
+    ({ name, source, ask_first }) => added(() => ops.newApp(env, { name, source, ask_first })),
   );
   server.registerTool(
     "update_script",
@@ -106,7 +108,11 @@ function createServer(env: Env, ui: string) {
     "add_api_source",
     {
       description: `Turn an HTTP API into an integration: one tool per operation for OpenAPI 3 and Google Discovery documents, or query and schema tools for a GraphQL endpoint. If the API needs a credential, say how it is sent with auth; the user then sets the API_TOKEN secret for it at ${ui}. Every user shares that one credential.`,
-      inputSchema: { name: z.string(), ...sourceInput },
+      inputSchema: {
+        name: z.string(),
+        ...sourceInput,
+        ask_first: z.array(z.string()).optional().describe("Tools that must wait for the user's approval each time they are called; * matches anything, e.g. [\"delete_*\"]. Only the user can change this list afterwards."),
+      },
     },
     (input) => added(() => ops.newSource(env, input)),
   );

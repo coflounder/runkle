@@ -1,6 +1,6 @@
 // Everything runkle can do, independent of how it is asked (web UI or MCP).
 
-import { createApp, decide, deleteApp, isApp, pendingReview, proposal, proposeApp, scriptName, secretNames, updateApp, type Deps } from "./apps.ts";
+import { appConfig, createApp, decide, deleteApp, isApp, pendingReview, proposal, proposeApp, scriptName, updateApp, type Deps } from "./apps.ts";
 import { cf, cfRaw, UpstreamError, type Env } from "./cloudflare.ts";
 import { httpsUrl, InputError, redirectUris, required, secretName, setTool, toMapping, type Mapping } from "./mapping.ts";
 import { skillsApp, sourceApp } from "./sources.ts";
@@ -47,8 +47,9 @@ export async function state(env: Env, me: string) {
   const [portal, apps] = await Promise.all([getPortal(env), accessApps(env)]);
   const oauth = portalApp(apps, portal)?.oauth_configuration;
   const servers: any[] = portal.servers ?? [];
-  // Which secrets each app has, by name, so an agent can tell when the user has entered them.
-  const secrets = await Promise.all(servers.map((s) => (isApp(s) ? secretNames(env, s.id).catch(() => []) : undefined)));
+  // Which secrets each app has, by name, so an agent can tell when the user has entered them,
+  // and which of its tools wait for the user's approval.
+  const config = await Promise.all(servers.map((s) => (isApp(s) ? appConfig(env, s.id).catch(() => ({ secrets: [], ask_first: [] })) : undefined)));
   // ponytail: two Cloudflare calls per script on every load; fetch on demand if the list grows slow.
   const pending = await Promise.all(servers.map((s) => isApp(s) && pendingReview(env, s.id).catch(() => false)));
   return {
@@ -61,7 +62,7 @@ export async function state(env: Env, me: string) {
       url: s.hostname,
       auth_type: s.auth_type,
       is_app: isApp(s),
-      ...(secrets[i] && { secrets_set: secrets[i] }),
+      ...(config[i] && { secrets_set: config[i].secrets, ask_first: config[i].ask_first }),
       ...(pending[i] && { pending_review: true }),
       auth_mode: s.auth_config_summary?.auth_mode,
       status: s.status,
@@ -202,17 +203,22 @@ export const newApp = (env: Env, input: unknown) => createApp(env, input, appDep
 
 // The credential, if any, becomes the generated app's API_TOKEN secret.
 export const newSource = async (env: Env, input: any) =>
-  newApp(env, { name: input.name, source: await sourceApp(input), secrets: input.token ? { API_TOKEN: input.token } : undefined });
+  newApp(env, { name: input.name, source: await sourceApp(input), secrets: input.token ? { API_TOKEN: input.token } : undefined, ask_first: input.ask_first });
 
 export const newSkills = (env: Env, input: any) => newApp(env, { name: input.name, source: skillsApp(input.skills) });
 
 const server = async (env: Env, id: string) => (await getPortal(env)).servers?.find((s: any) => s.id === id);
 
 export const changeApp = async (env: Env, id: string, input: any) =>
-  updateApp(env, await server(env, id), input.skills ? { source: skillsApp(input.skills) } : input, appDeps(env));
+  updateApp(
+    env,
+    await server(env, id),
+    input.skills ? { source: skillsApp(input.skills) } : { source: input.source, secrets: input.secrets, ask_first: input.ask_first },
+    appDeps(env),
+  );
 
 // What an agent may do to a script's source: deploy it, or leave it for review when the script holds secrets.
 export const proposeChange = async (env: Env, ui: string, id: string, source: unknown) => proposeApp(env, await server(env, id), { source }, appDeps(env), ui);
 export const proposeSource = async (env: Env, ui: string, id: string, input: any) => proposeChange(env, ui, id, await sourceApp(input));
 export const reviewChange = async (env: Env, id: string) => proposal(env, await server(env, id));
-export const decideChange = async (env: Env, id: string, input: any) => decide(env, await server(env, id), input, appDeps(env));
+export const decideChange = async (env: Env, id: string, input: any, by: string) => decide(env, await server(env, id), input, appDeps(env), by);

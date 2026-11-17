@@ -40,7 +40,7 @@ function route(request: Request, env: Env, me: string): (() => Promise<unknown>)
   if (id && key === `PUT /api/apps/${id}`) return async () => ops.changeApp(env, id, await body());
   // Deciding on an agent's proposed change is for people only: there is no MCP tool for it.
   if (id && key === `GET /api/apps/${id}/proposal`) return () => ops.reviewChange(env, id);
-  if (id && key === `POST /api/apps/${id}/proposal`) return async () => ops.decideChange(env, id, await body());
+  if (id && key === `POST /api/apps/${id}/proposal`) return async () => ops.decideChange(env, id, await body(), me);
   if (id && key === `DELETE /api/integrations/${id}`) return () => ops.removeIntegration(env, id);
   if (id && key === `POST /api/integrations/${id}/sync`) return () => ops.syncServer(env, id);
   if (id && key === `PUT /api/integrations/${id}/tools`) return async () => ops.toggleTool(env, id, await body());

@@ -34,6 +34,7 @@ database: Cloudflare's API is the store. Read `docs/architecture.md` first.
 - `src/sources.ts`: generates an app module from an OpenAPI or Discovery document, a GraphQL endpoint, or skills.
 - `src/index.ts`: Access auth and HTTP routes. `src/mcp.ts`: the same operations as MCP tools.
 - `public/`: the whole UI, no build step. The CSP in `_headers` forbids inline script and style.
+- `scripts/`: ready-made scripts people upload. They are ordinary scripts with no special access.
 - `npm test` (Node 22.18+), `npm run typecheck`, `npm run dev`.
 - Workers Builds deploys every push to `main`, so a merge is a production deploy.
 
@@ -45,7 +46,9 @@ secret to a response, or add an MCP tool parameter that carries one. Only ever
 touch Workers named `runkle-app-*`. An agent must not be able to change the
 code of a script that holds secrets without a person approving it
 (`proposeApp` in `src/apps.ts`): never add an MCP tool that deploys or
-approves such a change.
+approves such a change. The same goes for approvals (`gate` in
+`src/app-runtime.ts`): a person decides at `/approvals/<id>` behind Access,
+and no MCP tool may approve a call or shrink an app's ask-first list.
 
 Anything new that is not an MCP server becomes an app. Do not add a second
 way to serve tools. Bindings and secrets runkle gives an app are named

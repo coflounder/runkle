@@ -30,7 +30,7 @@ things Cloudflare already runs for you:
 - Publish skills: written instructions agents can read (see [Skills](#skills)).
 - Upload a script and get its functions as tools, plus storage, schedules,
   webhooks, pages and workflows (see [Scripts](#scripts)).
-- Allow or block each tool.
+- Allow or block each tool, or have it ask you first (see [Approvals](#approvals)).
 - Re-sync and remove integrations.
 - Choose which agent clients may register (localhost, loopback, listed redirect URIs).
 - Turn on code mode, where agents get `search` and `execute` instead of every tool.
@@ -40,14 +40,16 @@ things Cloudflare already runs for you:
 
 - An HTTP API uses one credential shared by everyone. Per-person sign-in is
   only for MCP servers.
-- Tools are allowed or blocked. There is no "ask me first".
+- "Ask me first" works for tools that run on runkle (scripts, HTTP APIs).
+  The portal calls a remote MCP server directly, so its tools can only be
+  allowed or blocked.
 - The one-time admin sign-in for automatically registered OAuth servers
   happens in the Cloudflare dashboard; the API has no way to start it.
   Integrations that use your own OAuth client don't need it.
 - One portal per deployment.
 - Uploaded scripts are a single module with no npm imports. They can `fetch`
   and use the Web APIs.
-- No catalog of ready-made apps.
+- No catalog of ready-made apps beyond the few in `scripts/`.
 
 ## Scripts
 
@@ -79,6 +81,16 @@ error naming the allowed ones, unless `input` sets `additionalProperties: true`.
 Choose **Add integration > Upload a script**, pick the file, and add the
 secrets it reads from `env`. runkle deploys it as a Worker named
 `runkle-app-<name>` on your account and registers it with the portal.
+
+A tool can ask you first. Add `approval: true`, or a function that decides
+per call and says what you would be agreeing to:
+
+```js
+merge: {
+  approval: async ({ repo, number }, env) => `Merge pull request ${number} in ${repo}`, // return nothing to run unasked
+  async run({ repo, number }, env) { /* ... */ },
+},
+```
 
 `tools` is one of six things a script can export. All are optional:
 
@@ -189,9 +201,56 @@ Don't paste a secret into a script's source. Use a secret field.
 
 A script's code can read its secrets, so an agent cannot change a script that
 holds any. Its update waits as a proposal: the script row shows **Review
-proposed change**, where you read the diff and approve or reject it. Until
+proposed change**, where you read the diff and approve or reject it (you are
+notified of these too). Until
 then the code you last approved keeps running, and the script's secrets cannot
 be edited.
+
+## Approvals
+
+Some calls should not run until you have said yes: minting a token, merging
+to main, deleting something. A tool asks first when either
+
+- you list it under **Update script or secrets > Ask me first** (tool names,
+  `*` matches anything; agents can set this list when they create an
+  integration and never afterwards), or
+- its script says so with `approval` (see [Scripts](#scripts)).
+
+Such a call does not run. The agent gets a link instead, and you get the same
+link on your phone if a notification address is set. The page is on the
+script's own address behind Cloudflare Access; it shows the tool, its
+arguments and the script's one-line summary, with **Approve** and **Deny**.
+The agent repeats the call and it runs, once, with exactly the arguments you
+saw. A request you don't answer lapses after an hour, and so does an approval
+that is never used.
+
+Every decision is kept with who made it: open **Approvals and log** on the
+integration, or `/approvals` on the script's address. Decisions on a proposed
+script change (below) are kept in that Worker's version history.
+
+To be told on your phone, set the `NOTIFY_URL` secret to an address that
+accepts a POST with the message as text and `Title` and `Click` headers. A
+topic on [ntfy](https://ntfy.sh) works as is: pick a long random topic name,
+subscribe to it in the ntfy app, and run
+
+```sh
+npx wrangler secret put NOTIFY_URL   # https://ntfy.sh/<your-topic>
+```
+
+Scripts pick the address up the next time they are uploaded or updated.
+Without it, the agent is told to give you the link.
+
+### Ready-made scripts
+
+`scripts/cloudflare-tokens.js` mints Cloudflare API tokens for agents that
+never see them. An agent names a purpose, permissions, a lifetime and a Worker
+secret to fill; you approve; the token goes straight to that secret. With no
+Worker named, you get a page that shows it once. Every mint asks first. A
+constant at the top, `SKIP_APPROVAL_FOR_SHORT_READ_ONLY`, lets read-only
+tokens of an hour or less through to runkle's own scripts unasked; it is off.
+Upload it under **Add integration > Upload a script** with the secrets
+`MINTER_TOKEN` (an account token with `Account API Tokens Write`) and
+`ACCOUNT_ID`.
 
 ## Managing runkle from an agent
 
