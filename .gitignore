@@ -2,9 +2,10 @@ node_modules
 .wrangler
 .dev.vars
 
-# Local working notes and editor settings
+# Local working notes and editor settings. .claude/ itself is shared: Ilk
+# writes Claude Code's skills, commands and session hook there.
 replica/
-.claude/
+.claude/settings.local.json
 
 # ilk:begin layer=ilk/core region=core — managed by ilk — edits inside this block are overwritten; run `ilk rm` to remove it
 # ilk keeps fetched layer sources here; they are rebuildable.
