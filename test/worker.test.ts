@@ -124,6 +124,7 @@ test("upload a script: deployed, secured, callable, updatable, removable", async
   assert.match(token, /^[0-9a-f]{64}$/);
   assert.equal(fake.credentials.get("garmin"), token, "the portal holds the same token as the script");
   assert.equal(fake.servers.get("garmin").hostname, "https://runkle-app-garmin.acme.workers.dev/mcp");
+  assert.deepEqual(deployed.flags, ["global_fetch_strictly_public"], "an app can fetch other Workers on its workers.dev subdomain");
 
   // Nothing secret ever comes back out of runkle.
   const stateText = await (await call("GET", "/api/state")).text();

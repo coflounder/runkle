@@ -13,7 +13,7 @@ registerHooks({
   resolve: (specifier, context, next) => (specifier === "cloudflare:workers" ? { url: WORKERS, shortCircuit: true } : next(specifier, context)),
 });
 
-type Script = { versions: Record<string, string>[]; deployed: number; modules: Record<string, string>; secrets: Record<string, string>; data: Map<string, unknown>; schedules: { cron: string }[]; mod?: any };
+type Script = { versions: Record<string, string>[]; deployed: number; flags: string[]; modules: Record<string, string>; secrets: Record<string, string>; data: Map<string, unknown>; schedules: { cron: string }[]; mod?: any };
 
 export function fakeCloudflare() {
   const servers = new Map<string, any>();
@@ -96,7 +96,7 @@ export function fakeCloudflare() {
       const versions = [...(old?.versions ?? []), modules];
       // A version upload is stored but not deployed: the old code keeps serving.
       if (path.endsWith("/versions")) return (old!.versions = versions), ok({ id: `v${versions.length - 1}` });
-      scripts.set(script, { versions, deployed: versions.length - 1, modules, secrets: { ...kept, ...secrets }, data: old?.data ?? new Map(), schedules: old?.schedules ?? [] });
+      scripts.set(script, { versions, deployed: versions.length - 1, flags: meta.compatibility_flags ?? [], modules, secrets: { ...kept, ...secrets }, data: old?.data ?? new Map(), schedules: old?.schedules ?? [] });
       return ok({ id: script });
     }
     if (script && key.endsWith("/versions")) return ok({ items: scripts.get(script)!.versions.map((_, n) => ({ id: `v${n}` })).reverse() });
