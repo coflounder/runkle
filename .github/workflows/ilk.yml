@@ -1,0 +1,46 @@
+# Seeded by ilk and yours to edit — ilk will not touch this file again.
+#
+# Changed from the seed in two ways:
+#
+#   * The seed installs ilk with `curl … install.sh | sh`, which needs a GitHub
+#     release, and ilk has published none yet. So this pins ilk to a commit with
+#     `go install`. Every layer here is built into the binary, so the pin is the
+#     whole of what this job checks against.
+#
+#   * The gates (tests and typecheck) need Node and npm ci, and the CI
+#     workflow already runs both. This job skips them and checks what nothing
+#     else does: the record, secrets and drift.
+name: ilk
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ilk check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `record.stale` compares documents against the history of the code they
+          # describe, so it needs more than a shallow clone.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          # This repository has no Go module for the cache to key on.
+          cache: false
+
+      - name: Install ilk
+        run: |
+          go install github.com/coflounder/ilk/cmd/ilk@97afbeaf43679f0c08cd8b3f087f1a285ce9d997
+          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+
+      - name: Check
+        run: ilk check --skip gates.build,gates.lint,gates.tests
