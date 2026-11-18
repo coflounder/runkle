@@ -39,7 +39,7 @@ jobs:
 
       - name: Install ilk
         run: |
-          go install github.com/coflounder/ilk/cmd/ilk@97afbeaf43679f0c08cd8b3f087f1a285ce9d997
+          go install github.com/coflounder/ilk/cmd/ilk@0d5f436f1b2c37235e3c198fed20b165e7128c38
           echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
 
       - name: Check
