@@ -123,6 +123,8 @@ header. Agents that reach runkle through the portal never hold that token.
   reported and the add is rolled back best-effort.
 - **Nothing lists an app's webhooks and pages later.** They are returned by
   the upload and follow a fixed URL pattern; there is nowhere to keep them.
-- **runkle needs `global_fetch_strictly_public`.** Without that compatibility
-  flag a Worker fetching another Worker on the same workers.dev subdomain gets
-  a 404, so the manifest request fails.
+- **runkle and every app need `global_fetch_strictly_public`.** Without that
+  compatibility flag a Worker fetching another Worker on the same workers.dev
+  subdomain gets a 404 (error 1042), so the manifest request fails, and an app
+  such as Access Check cannot open a Workers Preview. With it, such a fetch
+  goes through Cloudflare's front door, Access included.

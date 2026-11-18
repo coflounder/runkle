@@ -22,6 +22,10 @@ function upload(env: Env, id: string, source: string, secrets: Record<string, st
   const metadata = {
     main_module: "index.js",
     compatibility_date: "2026-11-01",
+    // Same reason as runkle's own flag: without it, an app that fetches another
+    // Worker on this workers.dev subdomain (Access Check opening a Workers
+    // Preview, say) gets Cloudflare error 1042 instead of the page.
+    compatibility_flags: ["global_fetch_strictly_public"],
     ...(pending ? { annotations: { "workers/message": "Proposed by an agent, waiting for review in runkle" } } : { observability: { enabled: true } }),
     exports: { Store: { type: "durable-object", state: "created", storage: "sqlite" } },
     bindings: [
