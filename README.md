@@ -229,14 +229,20 @@ an identity provider.
    (`<team>.cloudflareaccess.com`) and the application's AUD tag into
    `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` in `wrangler.jsonc`, then deploy again.
 
-### Deploy from a fork with GitHub Actions
+### Deploy on every merge with Workers Builds
 
-Fork the repository and enable Actions on the fork. Under Settings > Secrets
-and variables > Actions, add the secret `CLOUDFLARE_API_TOKEN` (the token from
-step 2) and the variables `CLOUDFLARE_ACCOUNT_ID`, `PORTAL_ID`,
-`ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. Every push to `main` then runs the
-tests and deploys. Without `CLOUDFLARE_ACCOUNT_ID` the deploy is skipped, so
-the fork needs no changes of its own.
+Connect the Worker to your repository (or fork) in the dashboard under the
+Worker's Settings > Builds, so every push to `main` deploys with no token in
+GitHub. Set the build variables `ACCOUNT_ID`, `PORTAL_ID`,
+`ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`, turn off builds for other branches, and
+use this deploy command:
+
+```sh
+npx wrangler deploy --var "ACCOUNT_ID:$ACCOUNT_ID" --var "PORTAL_ID:$PORTAL_ID" --var "ACCESS_TEAM_DOMAIN:$ACCESS_TEAM_DOMAIN" --var "ACCESS_AUD:$ACCESS_AUD"
+```
+
+The `CLOUDFLARE_API_TOKEN` secret from step 3 stays on the Worker across
+deploys. GitHub Actions only runs the tests.
 
 Until step 4 is done, every API request is refused. Anyone the Worker's
 Access policy lets in can add and remove integrations, so keep it to admins.

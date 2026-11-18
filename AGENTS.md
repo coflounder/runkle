@@ -35,6 +35,7 @@ database: Cloudflare's API is the store. Read `docs/architecture.md` first.
 - `src/index.ts`: Access auth and HTTP routes. `src/mcp.ts`: the same operations as MCP tools.
 - `public/`: the whole UI, no build step. The CSP in `_headers` forbids inline script and style.
 - `npm test` (Node 22.18+), `npm run typecheck`, `npm run dev`.
+- Workers Builds deploys every push to `main`, so a merge is a production deploy.
 
 A portal update replaces its whole server mapping. Never send a partial one;
 go through `toMapping` and `putPortal`.
