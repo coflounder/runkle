@@ -1,0 +1,93 @@
+---
+id: docs-readme
+title: What belongs in reference/
+status: current
+updated: 2026-01-01
+---
+
+# reference/ — what is true now
+
+Present tense, current state. If a statement in here is no longer true of the code,
+it is a bug in this directory.
+
+This is not a place for history (that is `log/`) or for intent
+(that is `plans/`). "We are going to move to Postgres" does not belong
+here. "The system uses Postgres" does, once it does.
+
+## Filename grammar
+
+`TYPE-kebab-slug.md`, where `TYPE` is uppercase. `ARCH-system-overview.md` is a
+record; `arch_system_overview.md` is an error `ilk check` will catch and tell you
+how to fix.
+
+Common types — extend the set freely, the check only requires that the shape holds:
+
+| Type | For |
+|---|---|
+| `ARCH` | Architecture, boundaries, data flow |
+| `API` | Interfaces and contracts |
+| `OPS` | Deployment, runbooks, on-call |
+| `DEC` | A decision and the reasoning behind it |
+| `REF` | Reference material, conventions, glossaries |
+
+## Frontmatter
+
+Every document carries:
+
+```yaml
+---
+id: arch-system-overview     # stable; other documents link by it
+title: System overview
+status: current              # current | draft | superseded
+updated: 2026-08-06          # when you last read this against the code
+covers:                      # what this document describes
+  - src/server/**
+  - internal/api/**
+---
+```
+
+## Staleness is measured against `covers:`, not the calendar
+
+`covers:` is the important field. It names the paths this document describes, and
+`ilk check` marks the document stale when enough commits have touched those paths
+since it was last read.
+
+That is deliberately not a timer. A fixed expiry is wrong for almost everybody: a
+week is an eternity for a prototype and nothing at all for a stable subsystem. Worse,
+a timer teaches people to bump a date to silence it — the one habit a documentation
+check must never train.
+
+Coupling calibrates itself. Code nobody has touched cannot make its documentation
+stale, however old that documentation is. Code rewritten yesterday makes it stale
+immediately. The project's own pace sets the pace of review.
+
+A document with no `covers:` is never stale, which is indistinguishable from one
+that is always right — so `record.coverage` reports it. A `covers:` pattern that
+matches nothing is worse still, because it looks like it is working; that is
+reported too.
+
+Some documents genuinely are not coupled to any path — a rationale, a glossary, a
+convention. Say so explicitly:
+
+```yaml
+covers: []   # not coupled to any path: this is reasoning, not description
+```
+
+The empty list is accepted where a missing key is not. The difference is that one
+is a decision somebody made and a reader can see, and the other is an oversight.
+
+When a document is flagged:
+
+```
+ilk record review docs/ARCH-system-overview.md
+```
+
+It prints the commits and diffstat under those paths since the document was last
+read, then records the review. Read what it shows you before accepting it — an
+uninformed acknowledgement is how a record stops being trustworthy.
+
+Create one with the naming and frontmatter already correct:
+
+```
+ilk record new reference "System overview"
+```

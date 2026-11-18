@@ -5,3 +5,12 @@ node_modules
 # Local working notes and editor settings
 replica/
 .claude/
+
+# ilk:begin layer=ilk/core region=core — managed by ilk — edits inside this block are overwritten; run `ilk rm` to remove it
+# ilk keeps fetched layer sources here; they are rebuildable.
+.ilk/cache/
+# ilk:end layer=ilk/core region=core
+
+# ilk:begin layer=ilk/record region=ignore — managed by ilk — edits inside this block are overwritten; run `ilk rm` to remove it
+scratch/
+# ilk:end layer=ilk/record region=ignore

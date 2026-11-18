@@ -1,0 +1,28 @@
+# ilk — declared process layers for this repository.
+#
+# This file is the desired state. `ilk apply` reconciles the repository to it.
+# `ilk add <layer>` and `ilk rm <layer>` edit it for you, but editing it
+# by hand and running `ilk apply` works exactly the same way.
+#
+# Capabilities tell layers how this project verifies itself. Layers require
+# capabilities rather than each other, so a gate layer works in any language:
+#
+#   capabilities:
+#     test.command: go test ./...
+#     lint.command: golangci-lint run
+#     build.command: go build ./...
+version: 1
+agents:
+  - claude-code
+capabilities:
+  build.command: npm run typecheck
+  test.command: npm test
+layers:
+  - id: ilk/compound-lessons
+    version: 0.2.0
+  - id: ilk/gates
+    version: 0.2.0
+  - id: ilk/secrets
+    version: 0.1.0
+budget:
+  instructions: 1500
