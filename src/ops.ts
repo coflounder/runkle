@@ -2,8 +2,9 @@
 
 import { appConfig, createApp, decide, deleteApp, isApp, pendingReview, proposal, proposeApp, scriptName, updateApp, type Deps } from "./apps.ts";
 import { cf, cfRaw, UpstreamError, type Env } from "./cloudflare.ts";
+import * as health from "./health.ts";
 import { inbox } from "./inbox.ts";
-import { httpsUrl, InputError, redirectUris, required, secretName, setTool, slug, toMapping, type Mapping } from "./mapping.ts";
+import { expiryDate, httpsUrl, InputError, redirectUris, required, secretName, setTool, slug, toMapping, type Mapping } from "./mapping.ts";
 import { skillsApp, sourceApp } from "./sources.ts";
 
 async function accessApps(env: Env): Promise<any[]> {
@@ -53,6 +54,7 @@ export async function state(env: Env, me: string) {
   const config = await Promise.all(servers.map((s) => (isApp(s) ? appConfig(env, s.id).catch(() => ({ secrets: [], ask_first: [] })) : undefined)));
   // ponytail: two Cloudflare calls per script on every load; fetch on demand if the list grows slow.
   const pending = await Promise.all(servers.map((s) => isApp(s) && pendingReview(env, s.id).catch(() => false)));
+  const expiries = await inbox(env.INBOX)("expiries");
   return {
     me,
     portal: { name: portal.name, hostname: portal.hostname, code_mode: portal.code_mode },
@@ -64,6 +66,7 @@ export async function state(env: Env, me: string) {
       auth_type: s.auth_type,
       is_app: isApp(s),
       ...(config[i] && { secrets_set: config[i].secrets, ask_first: config[i].ask_first }),
+      ...(expiries[s.id] && { secret_expiry: expiries[s.id] }),
       ...(pending[i] && { pending_review: true }),
       auth_mode: s.auth_config_summary?.auth_mode,
       status: s.status,
@@ -123,6 +126,7 @@ export async function removeIntegration(env: Env, id: string) {
   for (const app of serverApps(apps, id)) await cf(env, "DELETE", `/access/apps/${app.id}`);
   await cf(env, "DELETE", `${mcp}/servers/${id}`);
   if (portal.servers?.some((s: any) => s.id === id && isApp(s))) await deleteApp(env, id);
+  await inbox(env.INBOX)("expiry", { app: id, forget: true });
 }
 
 export async function toggleTool(env: Env, id: string, input: { tool?: string; enabled?: boolean }) {
@@ -207,7 +211,24 @@ const appDeps = (env: Env, ui: string): Deps => ({
   },
 });
 
-export const newApp = (env: Env, ui: string, input: unknown) => createApp(env, input, appDeps(env, ui));
+// Expiry dates given beside secret values, checked against the secrets they come with.
+function expiries(input: any): Record<string, string> {
+  if (input.expires == null) return {};
+  if (typeof input.expires !== "object" || Array.isArray(input.expires)) throw new InputError("expires must map secret names to dates");
+  const dates: Record<string, string> = {};
+  for (const [name, date] of Object.entries(input.expires)) {
+    if (!Object.hasOwn(input.secrets ?? {}, name)) throw new InputError(`An expiry date is given for ${name}, but no value`);
+    if (date) dates[name] = expiryDate(date, name);
+  }
+  return dates;
+}
+
+export async function newApp(env: Env, ui: string, input: any) {
+  const dates = expiries(input ?? {});
+  const made = await createApp(env, input, appDeps(env, ui));
+  if (Object.keys(dates).length) await inbox(env.INBOX)("expiry", { app: made.id, dates });
+  return made;
+}
 
 // The credential, if any, becomes the generated app's API_TOKEN secret.
 export const newSource = async (env: Env, ui: string, input: any) =>
@@ -218,13 +239,18 @@ export const newSkills = (env: Env, ui: string, input: any) => newApp(env, ui, {
 const server = async (env: Env, id: string) => (await getPortal(env)).servers?.find((s: any) => s.id === id);
 
 export async function changeApp(env: Env, ui: string, id: string, input: any) {
+  const dates = expiries(input);
   const result = await updateApp(
     env,
     await server(env, id),
     input.skills ? { source: skillsApp(input.skills) } : { source: input.source, secrets: input.secrets, ask_first: input.ask_first },
     appDeps(env, ui),
   );
-  if (input.secrets && Object.keys(input.secrets).length) await inbox(env.INBOX)("close", { id: `secrets:${id}`, state: "done" });
+  if (input.secrets && Object.keys(input.secrets).length) {
+    // A new value makes the old date wrong: it takes the date given with it, or none.
+    await inbox(env.INBOX)("expiry", { app: id, dates: Object.fromEntries(Object.keys(input.secrets).map((name) => [name, dates[name] ?? null])) });
+    await inbox(env.INBOX)("close", { id: `secrets:${id}`, state: "done" });
+  }
   return result;
 }
 
@@ -244,6 +270,28 @@ export async function reviewStatus(env: Env, id: string) {
     ...(last && last.state !== "open" && { last_decision: { decision: last.state, by: last.by, at: new Date(last.decided).toISOString() } }),
   };
 }
+
+// For agents: record when a secret stops working, a date and never a value. null forgets it.
+export async function setExpiry(env: Env, id: string, input: { name?: unknown; expires?: unknown }) {
+  const name = secretName(input.name);
+  const s = await server(env, id);
+  if (!s || !isApp(s)) throw new InputError(`No script or API named "${id}"`);
+  if (!(await appConfig(env, id)).secrets.includes(name)) throw new InputError(`${id} has no secret named ${name}`);
+  return { secret_expiry: await inbox(env.INBOX)("expiry", { app: id, dates: { [name]: input.expires == null ? null : expiryDate(input.expires, name) } }) };
+}
+
+// ---- Health (src/health.ts) ----
+
+async function healthReport(env: Env) {
+  const [portal, apps] = await Promise.all([getPortal(env), accessApps(env)]);
+  return health.check(env, portal.servers ?? [], portalApp(apps, portal)?.session_duration);
+}
+// For agents: a report only.
+export const checkIntegrations = (env: Env) => healthReport(env);
+// The UI's Check now and the daily Cron Trigger: also opens and closes the inbox's alerts.
+export const checkAndAlert = async (env: Env, ui?: string) => health.alert(env, await healthReport(env), ui);
+// The last report, or {} before the first check.
+export const lastHealth = async (env: Env) => (await inbox(env.INBOX)("health")) ?? {};
 
 // ---- The inbox, for the person (UI only) ----
 
@@ -267,8 +315,8 @@ export async function inboxDecide(env: Env, id: string, input: any, by: string) 
   return { dismissed: true };
 }
 
-export async function subscribe(env: Env, input: any, by: string) {
-  const res = await inbox(env.INBOX)("subscribe", { subscription: input.subscription, by });
+export async function subscribe(env: Env, input: any, by: string, ui: string) {
+  const res = await inbox(env.INBOX)("subscribe", { subscription: input.subscription, by, ui });
   if (res.error) throw new InputError(res.error);
   return res;
 }

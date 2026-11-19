@@ -48,6 +48,7 @@ function secretFields(container) {
     const row = h("div", { className: "secret" },
       h("input", { type: "text", placeholder: "NAME", ariaLabel: "Secret name", pattern: "[A-Z][A-Z0-9_]*", required: true, autocomplete: "off", spellcheck: false }),
       h("input", { type: "password", placeholder: "value", ariaLabel: "Secret value", required: true, autocomplete: "new-password" }),
+      h("input", { type: "date", ariaLabel: "Expires on (optional)", title: "Expires on (optional): runkle warns you 14 days before" }),
       remove);
     remove.onclick = () => row.remove();
     rows.append(row);
@@ -58,6 +59,7 @@ function secretFields(container) {
   container.append(rows, h("div", {}, add));
   return {
     values: () => Object.fromEntries([...rows.children].map((r) => [r.children[0].value, r.children[1].value])),
+    expires: () => Object.fromEntries([...rows.children].filter((r) => r.children[2].value).map((r) => [r.children[0].value, r.children[2].value])),
     clear: () => rows.replaceChildren(),
     add: addRow,
   };
@@ -181,6 +183,9 @@ async function setupNotify() {
 // ---- Integrations ----
 
 const STATUS = { ready: "Ready", waiting: "Waiting for sign-in", stale: "Needs sync", error: "Error" };
+// What the last health check found (src/health.ts), by integration id.
+const HEALTH = { ok: "Healthy", upstream_error: "Failing", needs_sign_in: "Needs sign-in", missing_secret: "Missing secret", expiring: "Secret expiring", unused_secret: "Unused secret" };
+let health = {};
 
 function integrationRow(i, open) {
   const status = (i.status || "waiting").toLowerCase().replace(/ .*/, "");
@@ -211,13 +216,18 @@ function integrationRow(i, open) {
     setTimeout(() => { delete remove.dataset.armed; remove.textContent = "Remove"; }, 4000);
   };
 
+  const checked = health[i.id];
+  const expiry = (name) => (i.secret_expiry?.[name] ? `${name} (expires ${i.secret_expiry[name]})` : name);
   return h("details", { className: "row", open, id: `i-${i.id}` },
     h("summary", {},
       h("span", { className: "grow wrap" }, h("strong", {}, i.name), h("br"), h("small", {}, i.is_app ? "Runs on runkle" : i.url)),
       h("small", {}, i.tools.length ? `${on} of ${i.tools.length} tools on` : ""),
+      checked ? h("span", { className: `badge ${checked.status === "ok" ? "ready" : checked.status === "unused_secret" ? "stale" : "error"}`, title: "At the last health check" }, HEALTH[checked.status]) : null,
       h("span", { className: `badge ${status}` }, STATUS[status] || i.status)),
     i.error ? h("p", { className: "error tools" }, i.error) : null,
-    i.secrets_set?.length ? h("p", { className: "muted tools" }, `Secrets set: ${i.secrets_set.join(", ")}`) : null,
+    ...(checked?.problems ?? []).map((p) => h("p", { className: "tools wrap" }, h("strong", {}, p.reason), " ", h("small", {}, p.fix))),
+    checked?.note ? h("p", { className: "muted tools" }, checked.note) : null,
+    i.secrets_set?.length ? h("p", { className: "muted tools" }, `Secrets set: ${i.secrets_set.map(expiry).join(", ")}`) : null,
     i.ask_first?.length ? h("p", { className: "muted tools" }, `Asks you first: ${i.ask_first.join(", ")}. Requests wait in the inbox.`) : null,
     h("div", { className: "tools" }, ...tools),
     h("div", { className: "actions" }, review, sync, edit,
@@ -226,8 +236,9 @@ function integrationRow(i, open) {
 }
 
 async function load() {
-  const [s] = await Promise.all([api("GET", "/api/state"), loadInbox()]);
+  const [s, , report] = await Promise.all([api("GET", "/api/state"), loadInbox(), api("GET", "/api/health")]);
   state = s;
+  showHealth(report);
   const open = new Set([...document.querySelectorAll("#integrations details[open]")].map((d) => d.id));
   $("me").textContent = `${s.portal.name} · ${s.me}`;
   $("integrations").replaceChildren(...(s.integrations.length
@@ -255,6 +266,18 @@ for (const button of document.querySelectorAll("[data-copy]"))
     button.textContent = "Copied";
     setTimeout(() => (button.textContent = "Copy"), 1500);
   };
+function showHealth(report) {
+  health = Object.fromEntries((report?.integrations ?? []).map((i) => [i.id, i]));
+  $("checked").textContent = report?.checked_at ? `Last checked ${new Date(report.checked_at).toLocaleString()}. ${report.sign_in}` : "";
+}
+// Runs the same check as the daily one; problems also land in the inbox as alerts.
+$("check").onclick = () =>
+  act($("check"), async () => {
+    const report = await api("POST", "/api/health");
+    const problems = report.integrations.reduce((n, i) => n + i.problems.length, 0);
+    $("notice").textContent = problems ? `${problems} problem${problems === 1 ? "" : "s"} found. Each is in your inbox and beside its integration.` : `All ${report.integrations.length} integrations look healthy.`;
+    $("notice").hidden = false;
+  });
 $("code-mode").onchange = (e) => act(e.target, () => api("PUT", "/api/portal", { code_mode: e.target.value }));
 
 $("agent-auth").onsubmit = (e) => {
@@ -286,7 +309,7 @@ $("add").onclick = () => { $("notice").hidden = true; showFields(); $("dialog").
 form.onsubmit = async (e) => {
   const made = await submit(e, $("form-error"), closeNew, async () => {
     const name = form.elements.name.value;
-    if (form.kind.value === "app") return api("POST", "/api/apps", { name, source: await form.file.files[0].text(), secrets: newSecrets.values() });
+    if (form.kind.value === "app") return api("POST", "/api/apps", { name, source: await form.file.files[0].text(), secrets: newSecrets.values(), expires: newSecrets.expires() });
     if (form.kind.value === "skills")
       return api("POST", "/api/skills", { name, skills: await Promise.all([...form.skill_files.files].map((f) => f.text())) });
     if (form.kind.value === "api")
@@ -327,6 +350,7 @@ appForm.onsubmit = (e) =>
     return api("PUT", `/api/apps/${appForm.dataset.id}`, {
       ...(file && { source: await file.text() }),
       secrets: appSecrets.values(),
+      expires: appSecrets.expires(),
       ...(ask !== appForm.dataset.ask && { ask_first: ask ? ask.split(/\s+/) : [] }),
     });
   }).then((made) => made?.id && showDeployed(made));

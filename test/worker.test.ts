@@ -768,3 +768,113 @@ test("runkle's own MCP server tells agents how to use the portal and what an add
   assert.equal(out.id, "playbooks");
   assert.match(out.next_steps, /reconnects this portal's connector.*fresh session.*update_api_source or update_script/);
 });
+
+// ---- Integration health ----
+
+test("secretReads finds the env names a module reads, and what a generated API needs", async () => {
+  const { secretReads } = await import("../src/health.ts");
+  const { sourceApp } = await import("../src/sources.ts");
+  const script = `const { GARMIN_EMAIL, PASSWORD: pw } = env; run(i, env) { return env.GARMIN_TOKEN + env["OTHER_KEY"] + secrets?.THIRD + env.RUNKLE_APP + env.lowercase; }`;
+  assert.deepEqual(secretReads(script).sort(), ["GARMIN_EMAIL", "GARMIN_TOKEN", "OTHER_KEY", "PASSWORD", "THIRD"]);
+  const open = await sourceApp({ kind: "openapi", spec: OPENAPI, auth: "none", secret_headers: { "x-tunnel-pass": "TUNNEL_PASS" } });
+  assert.deepEqual(secretReads(open), ["TUNNEL_PASS"], "an open API needs no API_TOKEN, though its client code mentions one");
+  assert.deepEqual(secretReads(await sourceApp({ kind: "openapi", spec: OPENAPI, auth: "bearer" })), ["API_TOKEN"]);
+});
+
+const DAY = 24 * 60 * 60 * 1000;
+const inDays = (n: number) => new Date(Date.now() + n * DAY).toISOString().slice(0, 10);
+
+test("a health check finds broken, unused and expiring secrets, alerts once per problem and closes what was fixed", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  await call("POST", "/api/push", { subscription: await browser("https://fcm.push.test/h") });
+
+  const garmin = `export const tools = { me: { run: (i, env) => env.GARMIN_TOKEN } };
+export const probe = async (env) => { if (env.GARMIN_TOKEN !== "good") throw new Error("HTTP 400: invalid API key"); };`;
+  const made = await call("POST", "/api/apps", { name: "Garmin", source: garmin, secrets: { GARMIN_TOKEN: "bad", GARMIN_EMAIL: "me@example.com" }, expires: { GARMIN_TOKEN: inDays(5) } });
+  assert.equal(made.status, 200);
+  await call("POST", "/api/sources", { name: "Dokploy", kind: "openapi", spec: OPENAPI, auth: "none", secret_headers: { "x-tunnel-pass": "TUNNEL_PASS" } });
+  await call("POST", "/api/integrations", { name: "Linear", url: "https://linear.example/mcp", auth: "oauth" });
+  await call("POST", "/api/skills", { name: "Notes", skills: [{ name: "n", description: "d", content: "# n" }] });
+  assert.deepEqual(await (await call("GET", "/api/health")).json(), {}, "nothing is reported before the first check");
+
+  const report: any = await (await call("POST", "/api/health")).json();
+  const by = Object.fromEntries(report.integrations.map((i: any) => [i.id, i]));
+  assert.equal(by.garmin.status, "upstream_error", "the worst problem names the status");
+  assert.deepEqual(by.garmin.problems.map((p: any) => [p.kind, p.secret]), [["upstream_error", undefined], ["expiring", "GARMIN_TOKEN"], ["unused_secret", "GARMIN_EMAIL"]]);
+  assert.match(by.garmin.problems[0].reason, /probe failed: HTTP 400: invalid API key/);
+  assert.match(by.garmin.problems[1].reason, new RegExp(`GARMIN_TOKEN expires on ${inDays(5)}, in [45] days`));
+  assert.deepEqual(by.dokploy.problems.map((p: any) => [p.kind, p.secret]), [["missing_secret", "TUNNEL_PASS"]]);
+  assert.match(by.dokploy.note, /declares no probe/);
+  assert.equal(by.linear.status, "needs_sign_in");
+  assert.deepEqual([by.notes.status, by.notes.problems], ["ok", []]);
+  for (const i of report.integrations) for (const p of i.problems) assert.ok(p.reason && p.fix, "every problem says why and what to do");
+  assert.ok(!JSON.stringify(report).includes("me@example.com") && !JSON.stringify(report).includes('"bad"'), "no secret value reaches the report");
+
+  const alerts = async () => ((await (await call("GET", "/api/inbox")).json()) as any).waiting.filter((i: any) => i.kind === "alert").map((i: any) => i.id).sort();
+  assert.deepEqual(await alerts(), [
+    "health:dokploy:missing-secret:tunnel-pass",
+    "health:garmin:expiring:garmin-token",
+    "health:garmin:unused-secret:garmin-email",
+    "health:garmin:upstream-error",
+    "health:linear:needs-sign-in",
+  ]);
+  assert.equal(fake.pushes.length, 5, "one notification per new problem");
+  assert.deepEqual(((await (await call("GET", "/api/health")).json()) as any).checked_at, report.checked_at, "the UI reads the last report");
+
+  // The daily run finds the same problems: the same items, nobody notified again.
+  const waits: Promise<unknown>[] = [];
+  await worker.scheduled({} as ScheduledController, env, { waitUntil: (p: Promise<unknown>) => waits.push(p) } as unknown as ExecutionContext);
+  await Promise.all(waits);
+  assert.equal((await alerts()).length, 5);
+  assert.equal(fake.pushes.length, 5);
+
+  // Fixed: a good key without a date, the tunnel pass set. Their alerts close at the next check.
+  await call("PUT", "/api/apps/garmin", { secrets: { GARMIN_TOKEN: "good" } });
+  await call("PUT", "/api/apps/dokploy", { secrets: { TUNNEL_PASS: "p" }, expires: { TUNNEL_PASS: "2027-11-19" } });
+  const state: any = await (await call("GET", "/api/state")).json();
+  assert.equal(state.integrations.find((i: any) => i.id === "garmin").secret_expiry, undefined, "a new value drops the old value's date");
+  assert.deepEqual(state.integrations.find((i: any) => i.id === "dokploy").secret_expiry, { TUNNEL_PASS: "2027-11-19" });
+  await call("POST", "/api/health");
+  assert.deepEqual(await alerts(), ["health:garmin:unused-secret:garmin-email", "health:linear:needs-sign-in"]);
+
+  // A probe answers only the one request runkle put a key in its inbox for.
+  const app = await fake.app("runkle-app-garmin");
+  const probe = (key: string) => app.worker.fetch(new Request("https://runkle-app-garmin.acme.workers.dev/manifest/probe", { headers: { Authorization: `Bearer ${key}` } }), app.env);
+  assert.equal((await probe("guess")).status, 401);
+  const key = "k".repeat(64);
+  await latest!.inbox.get({} as any).fetch("https://inbox/", { method: "POST", body: JSON.stringify({ op: "probe_key", app: "dokploy", key }) });
+  assert.equal((await probe(key)).status, 401, "a key for another app does not work");
+
+  // Removing an integration forgets its dates and, at the next check, its alerts.
+  await call("DELETE", "/api/integrations/dokploy");
+  assert.ok(![...fake.inboxData.keys()].includes("expiry:dokploy"));
+});
+
+test("dates are entered beside values and agents can record them, never a value", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  await call("POST", "/api/apps", { name: "Shots", source: `export const tools = { t: { run: (i, env) => env.SHOT_TOKEN } };`, secrets: { SHOT_TOKEN: "s" } });
+  assert.equal((await call("PUT", "/api/apps/shots", { secrets: { SHOT_TOKEN: "s2" }, expires: { SHOT_TOKEN: "2026-02-30" } })).status, 400);
+  assert.equal((await call("PUT", "/api/apps/shots", { secrets: { SHOT_TOKEN: "s2" }, expires: { OTHER: "2027-01-01" } })).status, 400, "a date needs its value");
+
+  const mcp = async (name: string, args: unknown) => {
+    const response = await call("POST", "/mcp", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, { "Content-Type": "application/json", Accept: "application/json, text/event-stream" });
+    return JSON.parse((await response.text()).match(/^data: (.*)$/m)![1]).result;
+  };
+  const set = await mcp("set_secret_expiry", { id: "shots", name: "SHOT_TOKEN", expires: inDays(90) });
+  assert.deepEqual(JSON.parse(set.content[0].text), { secret_expiry: { SHOT_TOKEN: inDays(90) } });
+  assert.equal((await mcp("set_secret_expiry", { id: "shots", name: "NOPE", expires: inDays(1) })).isError, true);
+  assert.equal((await mcp("set_secret_expiry", { id: "shots", name: "SHOT_TOKEN", expires: "soon" })).isError, true);
+
+  const checked = JSON.parse((await mcp("check_integrations", {})).content[0].text);
+  assert.deepEqual(checked.integrations.map((i: any) => [i.id, i.status]), [["shots", "ok"]], "90 days out is not a problem yet");
+  assert.match(checked.sign_in, /out of runkle's sight/);
+  assert.deepEqual(((await (await call("GET", "/api/inbox")).json()) as any).waiting, [], "an agent's check alerts no one");
+
+  await mcp("set_secret_expiry", { id: "shots", name: "SHOT_TOKEN", expires: inDays(-1) });
+  const expired = JSON.parse((await mcp("check_integrations", {})).content[0].text).integrations[0];
+  assert.match(expired.problems[0].reason, /SHOT_TOKEN expired on/);
+  await mcp("set_secret_expiry", { id: "shots", name: "SHOT_TOKEN", expires: null });
+  assert.equal(((await (await call("GET", "/api/state")).json()) as any).integrations[0].secret_expiry, undefined);
+});
