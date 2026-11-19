@@ -33,7 +33,10 @@ Cloudflare only.
 | POST `/api/integrations/:id/sync` | re-fetch tools | POST server sync |
 | PUT `/api/integrations/:id/tools` | allow or block one tool | PUT portal |
 | PUT `/api/agent-auth` | managed OAuth on/off, localhost/loopback, allowed redirect URIs | GET + PUT access app |
-| PUT `/api/portal` | code mode | PUT portal |
+| PUT `/api/portal` | code mode, of the main portal or with `collection` of one collection | PUT portal |
+| POST `/api/collections` | make a collection: DNS record like the main portal's, portal `runkle-<id>` with the chosen integrations' main-portal mappings, `mcp_portal` Access app with the main portal's policies and OAuth settings; rolled back on failure | GET zones, GET + POST dns_records, POST portal, POST access app |
+| PUT `/api/collections/:id` | add or remove integrations | GET portals, PUT portal |
+| DELETE `/api/collections/:id` | delete the portal, then its Access app, then the DNS record runkle made (found by its comment) | DELETE portal, DELETE access app, DELETE dns_record |
 | POST `/api/apps` | deploy an uploaded script as a Worker with its secrets, register it | PUT worker script, POST subdomain, then as POST `/api/integrations` |
 | PUT `/api/apps/:id` | replace a script's source, set secrets, and/or set its ask-first list (UI only for the list) | PUT worker script or PUT worker secrets |
 | GET, POST `/api/apps/:id/proposal` | read an agent's proposed change to a script; approve or reject it (UI only, no MCP tool) | GET worker versions and deployments, then as PUT `/api/apps/:id` |
@@ -44,7 +47,16 @@ Cloudflare only.
 | POST `/mcp` | the operations above as MCP tools, minus anything that carries a secret; `generate_secret` waits for approval in the inbox | as above |
 
 Token permissions: `MCP Portals Write`, `Access: Apps and Policies Write`,
-`Workers Scripts Write`.
+`Workers Scripts Write`; for collections, `Zone Read` and `DNS Edit` on the
+portal's zone.
+
+A collection is a second portal (`runkle-<id>`) with a subset of the main
+portal's servers. Every integration is registered in the main portal, which
+apps, health checks and generated secrets keep using; a collection only
+points at servers that already exist. Each server's own Access app applies in
+every portal it is in, so a collection narrows what an agent sees but not who
+may use a server. Removing an integration detaches it from every collection
+first.
 
 ## Uploaded scripts
 
@@ -264,6 +276,10 @@ it is updated once. HTTP API sources declare no probe.
 - **Admin sign-in for dynamically registered OAuth servers is dashboard-only.**
   The API has no way to start it, so the UI links to the dashboard for that
   one step. Servers with your own client need no admin sign-in.
+- **Creating a portal through the API makes no DNS record.** Without one the
+  hostname answers 522, so runkle copies the main portal's record. A
+  hostname two labels under the zone (`personal.mcp.example.com`) gets no
+  certificate from Universal SSL, hence `mcp-<id>.example.com`.
 - **CSRF.** Access authenticates by cookie, so mutations require a
   same-origin `Origin` header.
 - **Non-atomic add/remove.** Three Cloudflare calls; a failure midway is

@@ -37,6 +37,8 @@ things Cloudflare already runs for you:
 - Check that every integration works, daily and on demand, and hear about problems first (see [Health](#health)).
 - Choose which agent clients may register (localhost, loopback, listed redirect URIs).
 - Turn on code mode, where agents get `search` and `execute` instead of every tool.
+- Group integrations into collections, each its own endpoint, such as
+  Personal and Work (see [Collections](#collections)).
 - Do all of the above from an agent (see [Managing runkle from an agent](#managing-runkle-from-an-agent)).
 
 ## What it doesn't
@@ -49,7 +51,8 @@ things Cloudflare already runs for you:
 - The one-time admin sign-in for automatically registered OAuth servers
   happens in the Cloudflare dashboard; the API has no way to start it.
   Integrations that use your own OAuth client don't need it.
-- One portal per deployment.
+- Collections share the main portal's Access policy, so they scope what an
+  agent sees, not who may sign in.
 - Uploaded scripts are a single module with no npm imports. They can `fetch`
   and use the Web APIs.
 - No catalog of ready-made apps beyond the few in `scripts/`.
@@ -364,6 +367,30 @@ A Connect token is limited to the vaults you pick, like a service account.
    and `OP_CONNECT_TOKEN`, plus `CF_ACCESS_CLIENT_ID` and
    `CF_ACCESS_CLIENT_SECRET` if it is behind Access.
 
+## Collections
+
+A collection is its own MCP endpoint that serves only the integrations you
+pick, such as Personal or Work. An agent connected to the Personal
+collection sees your notes and your watch and nothing from work.
+
+Name it in the UI or have an agent call `create_collection`, and runkle
+makes everything a Cloudflare MCP portal needs: the portal on
+`mcp-<name>.<your domain>` (one label under the main portal's domain, so
+the domain's certificate covers it), its DNS record pointing where the main
+portal's does, and its Access application with the main portal's policies
+and agent sign-in settings. Then tick the integrations it serves. Each joins
+with the tool settings it has in the main portal; after that, its tools and
+code mode can be changed in the collection alone. Deleting a collection
+removes those three things and nothing else.
+
+The main portal keeps serving everything, and every integration is
+registered there first. runkle only touches portals whose ID starts with
+`runkle-`.
+
+What you still do yourself: add the collection's endpoint to your agent as
+a new connector (in claude.ai, Settings > Connectors) and sign in, including
+to each integration that signs every person in with OAuth.
+
 ## Managing runkle from an agent
 
 runkle serves its own MCP endpoint at `https://<your runkle hostname>/mcp`
@@ -396,7 +423,9 @@ an identity provider.
    Creating it there also makes its DNS record and Access application. Add an
    Access policy for the people who should use it. Note the portal's ID.
 2. **Create an API token** with `MCP Portals Write`,
-   `Access: Apps and Policies Write` and `Workers Scripts Write`. Uploaded
+   `Access: Apps and Policies Write` and `Workers Scripts Write`, plus
+   `Zone Read` and `DNS Edit` on the portal's zone for
+   [collections](#collections). Uploaded
    scripts are served from your account's `workers.dev` subdomain, so it
    must be set up.
 3. **Configure and deploy.**

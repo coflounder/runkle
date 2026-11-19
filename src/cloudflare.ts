@@ -11,11 +11,11 @@ export type Env = {
 
 export class UpstreamError extends Error {}
 
-// `path` is relative to the account, e.g. "/access/apps". A FormData body is sent as multipart.
-export async function cfRaw(env: Env, method: string, path: string, body?: unknown): Promise<any> {
+// `path` is relative to the API, e.g. "/zones". A FormData body is sent as multipart.
+export async function cfApi(env: Env, method: string, path: string, body?: unknown): Promise<any> {
   const base = env.CF_API_BASE ?? "https://api.cloudflare.com/client/v4";
   const multipart = body instanceof FormData;
-  const res = await fetch(`${base}/accounts/${env.ACCOUNT_ID}${path}`, {
+  const res = await fetch(`${base}${path}`, {
     method,
     headers: { Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`, ...(!multipart && { "Content-Type": "application/json" }) },
     body: body === undefined ? undefined : multipart ? body : JSON.stringify(body),
@@ -28,9 +28,16 @@ export async function cfRaw(env: Env, method: string, path: string, body?: unkno
   return json;
 }
 
+// `path` is relative to the account, e.g. "/access/apps".
+export const cfRaw = (env: Env, method: string, path: string, body?: unknown) => cfApi(env, method, `/accounts/${env.ACCOUNT_ID}${path}`, body);
+
 // An app's own hostname. With CF_API_BASE set (tests, local dev) it is served by the fake.
 export const appFetch = (env: Env, host: string, path: string, init?: RequestInit) =>
   fetch(env.CF_API_BASE ? `${env.CF_API_BASE}/__app/${host}${path}` : `https://${host}${path}`, init);
 
 export const cf = async <T = any>(env: Env, method: string, path: string, body?: unknown): Promise<T> =>
   (await cfRaw(env, method, path, body)).result;
+
+// For a zone's DNS records, which sit outside the account.
+export const cfZone = async <T = any>(env: Env, method: string, path: string, body?: unknown): Promise<T> =>
+  (await cfApi(env, method, path, body)).result;

@@ -65,6 +65,18 @@
     </div>
   </section>
 
+  <section aria-labelledby="h-coll">
+    <h2 id="h-coll">Collections</h2>
+    <div class="card" id="collections" aria-live="polite"></div>
+    <form class="card pad" id="new-collection">
+      <p class="muted">A collection is its own endpoint that serves only the integrations you tick, such as Personal or Work, so an agent connected to it sees nothing else. runkle sets up its address, DNS and sign-in. The endpoint above keeps serving everything.</p>
+      <div class="copy">
+        <input type="text" name="name" required maxlength="40" placeholder="Personal" aria-label="New collection name">
+        <button class="primary">Create collection</button>
+      </div>
+    </form>
+  </section>
+
   <section aria-labelledby="h-admin">
     <h2 id="h-admin">Let an agent manage runkle</h2>
     <div class="card pad">

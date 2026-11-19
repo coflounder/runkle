@@ -70,9 +70,12 @@ export function fakeCloudflare() {
     ["portal-app", { id: "portal-app", type: "mcp_portal", domain: "mcp.example.com", policies: [{ id: "pol-1" }] }],
   ]);
   const portal: any = { id: "main", name: "Main", hostname: "mcp.example.com", code_mode: "opt_in", servers: [] };
+  const portals = new Map<string, any>([["main", portal]]); // collections are runkle-* portals beside it
+  const zones = [{ id: "zone-1", name: "example.com", account: { id: "acct" } }];
+  const dns = new Map<string, any>([["rec-0", { id: "rec-0", type: "CNAME", name: "mcp.example.com", content: "portal.gateway.test", proxied: true }]]);
   let nextApp = 1;
 
-  const view = () => ({
+  const view = (portal: any) => ({
     ...portal,
     servers: portal.servers.map((m: any) => ({
       ...servers.get(m.server_id),
@@ -97,7 +100,7 @@ export function fakeCloudflare() {
       const { worker, env } = await app(host.split(".")[0]);
       return worker.fetch(new Request(`https://${host}${rest}`, request), env, {});
     }
-    const path = url.pathname.replace(/^.*\/accounts\/[^/]+/, "");
+    const path = url.pathname.replace(/^.*?\/client\/v4/, "").replace(/^\/accounts\/[^/]+/, "");
     const multipart = request.headers.get("Content-Type")?.startsWith("multipart/");
     const form = multipart ? await request.formData() : undefined;
     const body: any = !multipart && request.body ? await request.json() : undefined;
@@ -156,12 +159,32 @@ export function fakeCloudflare() {
     }
     if (appId && request.method === "PUT") return apps.set(appId, body), ok(body);
     if (appId && request.method === "DELETE") return apps.delete(appId), ok({ id: appId });
-    if (key === "GET /access/ai-controls/mcp/portals/main") return ok(view());
-    if (key === "PUT /access/ai-controls/mcp/portals/main") {
-      if (body.servers.some((m: any) => !servers.has(m.server_id))) return fail(400, "unknown server in mapping");
-      Object.assign(portal, body);
-      return ok(view());
+    const portalId = path.match(/^\/access\/ai-controls\/mcp\/portals\/([^/]+)$/)?.[1];
+    const known = (mapping: any[]) => mapping.every((m: any) => servers.has(m.server_id));
+    if (key === "GET /access/ai-controls/mcp/portals") return ok([...portals.values()].map(({ servers, ...p }) => p));
+    if (key === "POST /access/ai-controls/mcp/portals") {
+      if (portals.has(body.id) || [...portals.values()].some((p) => p.hostname === body.hostname)) return fail(409, "portal exists");
+      if (!known(body.servers)) return fail(400, "unknown server in mapping");
+      return portals.set(body.id, structuredClone(body)), ok(view(portals.get(body.id)));
     }
+    if (portalId && !portals.has(portalId)) return fail(404, "no such portal");
+    if (portalId && request.method === "GET") return ok(view(portals.get(portalId)));
+    if (portalId && request.method === "PUT") {
+      if (!known(body.servers)) return fail(400, "unknown server in mapping");
+      Object.assign(portals.get(portalId), body);
+      return ok(view(portals.get(portalId)));
+    }
+    if (portalId && request.method === "DELETE") return portals.delete(portalId), ok(null);
+    if (key === "GET /zones") return ok(zones.filter((z) => z.name === url.searchParams.get("name") && z.account.id === url.searchParams.get("account.id")));
+    const zone = path.match(/^\/zones\/([^/]+)\/dns_records/)?.[1];
+    if (zone && zone !== "zone-1") return fail(404, "no such zone");
+    if (zone && request.method === "GET") return ok([...dns.values()].filter((r) => r.name === url.searchParams.get("name")));
+    if (zone && request.method === "POST") {
+      const record = { ...body, id: `rec-${nextApp++}` };
+      return dns.set(record.id, record), ok(record);
+    }
+    const recordId = path.match(/\/dns_records\/([^/]+)$/)?.[1];
+    if (zone && recordId && request.method === "DELETE") return dns.delete(recordId) ? ok({ id: recordId }) : fail(404, "no such record");
     if (key === "POST /access/ai-controls/mcp/servers") {
       if (new URL(body.hostname).hostname === "down.example.com") return fail(400, "upstream unreachable");
       const { auth_credentials, client_secret, ...rest } = body;
@@ -192,7 +215,7 @@ export function fakeCloudflare() {
   }
 
   latest = { inbox };
-  return { handle, servers, apps, portal, scripts, credentials, workflows, app, pushes, inbox, inboxData };
+  return { handle, servers, apps, portal, portals, dns, scripts, credentials, workflows, app, pushes, inbox, inboxData };
 }
 
 if (import.meta.main) {

@@ -63,10 +63,16 @@ function createServer(env: Env, ui: string) {
   };
   const added = (fn: () => Promise<object>) => run(async () => ({ ...(await fn()), next_steps: NEXT_STEPS }));
   const id = z.string().describe("Integration id from list_integrations");
+  const collection = z.string().describe("Collection id from list_integrations");
+  const inCollection = collection.optional().describe("A collection id from list_integrations, to change only that collection. Without it, the change is to the portal that serves every integration.");
 
   server.registerTool(
     "list_integrations",
-    { description: "List every integration with its status and tools, plus the portal endpoint and agent sign-in settings.", annotations: { readOnlyHint: true } },
+    {
+      description:
+        "List every integration with its status and tools, plus the portal endpoint, the collections (each a separate endpoint serving some of the integrations, with the tools it blocks) and agent sign-in settings.",
+      annotations: { readOnlyHint: true },
+    },
     () => run(() => ops.state(env, "agent")),
   );
   server.registerTool(
@@ -212,7 +218,7 @@ function createServer(env: Env, ui: string) {
   );
   server.registerTool(
     "set_tool_enabled",
-    { description: "Allow or block one tool of an integration for agents using the portal.", inputSchema: { id, tool: z.string(), enabled: z.boolean() } },
+    { description: "Allow or block one tool of an integration for agents using the portal, or one collection.", inputSchema: { id, tool: z.string(), enabled: z.boolean(), collection: inCollection } },
     ({ id, ...input }) => run(() => ops.toggleTool(env, id, input)),
   );
   server.registerTool(
@@ -225,8 +231,35 @@ function createServer(env: Env, ui: string) {
   );
   server.registerTool(
     "set_code_mode",
-    { description: "Set the portal's code mode policy.", inputSchema: { code_mode: z.enum(["off", "opt_in", "default_on", "enforced"]) } },
+    { description: "Set the code mode policy of the portal, or of one collection.", inputSchema: { code_mode: z.enum(["off", "opt_in", "default_on", "enforced"]), collection: inCollection } },
     (input) => run(() => ops.setCodeMode(env, input)),
+  );
+  server.registerTool(
+    "create_collection",
+    {
+      description:
+        "Make a collection: its own MCP endpoint that serves only the integrations you name, such as Personal or Work, so an agent connected to it sees nothing else. runkle sets up the hostname, its DNS record and its sign-in. Integrations join with the tool settings they have in the main portal. Every integration stays in the main portal too.",
+      inputSchema: { name: z.string().describe("e.g. Personal"), integrations: z.array(id).optional() },
+    },
+    (input) => run(() => ops.createCollection(env, input)),
+  );
+  server.registerTool(
+    "set_collection_integrations",
+    {
+      description: "Add integrations to a collection or take them out. Added ones join with the tool settings they have in the main portal. Agents connected to the collection see the change in a fresh session.",
+      inputSchema: { collection, add: z.array(id).optional(), remove: z.array(id).optional() },
+      annotations: { idempotentHint: true },
+    },
+    ({ collection, ...input }) => run(() => ops.setCollection(env, collection, input)),
+  );
+  server.registerTool(
+    "delete_collection",
+    {
+      description: "Delete a collection's endpoint, with its DNS record and sign-in. Its integrations keep working in the main portal and any other collection. Agents connected to it lose access.",
+      inputSchema: { collection },
+      annotations: { destructiveHint: true },
+    },
+    ({ collection }) => run(() => ops.deleteCollection(env, collection)),
   );
 
   return server;

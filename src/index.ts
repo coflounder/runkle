@@ -32,6 +32,7 @@ function route(request: Request, env: Env, me: string): (() => Promise<unknown>)
   const body = () => request.json().catch(() => ({})) as Promise<any>;
   const id = pathname.match(/^\/api\/(?:integrations|apps)\/([a-z0-9-]{1,32})(?:\/|$)/)?.[1];
   const item = pathname.match(/^\/api\/inbox\/([a-z0-9:-]{1,128})$/)?.[1];
+  const collection = pathname.match(/^\/api\/collections\/([a-z0-9-]{1,24})$/)?.[1];
 
   if (key === "GET /api/state") return () => ops.state(env, me);
   if (key === "POST /api/integrations") return async () => ops.registerServer(env, serverBody(await body()));
@@ -40,6 +41,9 @@ function route(request: Request, env: Env, me: string): (() => Promise<unknown>)
   if (key === "POST /api/skills") return async () => ops.newSkills(env, ui, await body());
   if (key === "PUT /api/agent-auth") return async () => ops.setAgentAuth(env, await body());
   if (key === "PUT /api/portal") return async () => ops.setCodeMode(env, await body());
+  if (key === "POST /api/collections") return async () => ops.createCollection(env, await body());
+  if (collection && key === `PUT /api/collections/${collection}`) return async () => ops.setCollection(env, collection, await body());
+  if (collection && key === `DELETE /api/collections/${collection}`) return () => ops.deleteCollection(env, collection);
   if (id && key === `PUT /api/apps/${id}`) return async () => ops.changeApp(env, ui, id, await body());
   // A person generating a secret from the UI is the approval; an agent's generate_secret waits in the inbox.
   if (key === "POST /api/generate") return async () => ops.generateSecret(env, ui, await body(), me);

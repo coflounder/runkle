@@ -100,6 +100,79 @@ test("add, toggle, and remove integrations without disturbing the others", async
   assert.equal(fake.apps.get("portal-app").policies.length, 1, "existing Access settings survive the update");
 });
 
+test("collections: runkle makes the portal, DNS and sign-in, fills it, scopes tools and takes it all down", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  const state = async () => (await (await call("GET", "/api/state")).json()) as any;
+  fake.apps.get("portal-app").oauth_configuration = { enabled: true, dynamic_client_registration: { enabled: true, allow_any_on_localhost: true } };
+  fake.apps.get("portal-app").session_duration = "24h";
+  for (const name of ["Notes", "Garmin", "Linear"]) await call("POST", "/api/integrations", { name, url: `https://${name.toLowerCase()}.example/mcp`, auth: "none" });
+  await call("PUT", "/api/integrations/garmin/tools", { tool: "delete_record", enabled: false });
+
+  const made = (await (await call("POST", "/api/collections", { name: "Personal", integrations: ["notes", "garmin"] })).json()) as any;
+  assert.equal(made.endpoint, "https://mcp-personal.example.com/mcp", "one label under the main portal's domain");
+  const portal = fake.portals.get("runkle-personal");
+  assert.deepEqual(portal.servers.map((m: any) => m.server_id), ["notes", "garmin"]);
+  assert.deepEqual(portal.servers[1].updated_tools, [{ name: "delete_record", enabled: false }], "joins with the main portal's tool settings");
+  assert.equal(portal.code_mode, "opt_in");
+  const record = [...fake.dns.values()].find((r) => r.name === "mcp-personal.example.com");
+  assert.deepEqual([record.type, record.content, record.proxied], ["CNAME", "portal.gateway.test", true], "points where the main portal does");
+  const gate = [...fake.apps.values()].find((a) => a.type === "mcp_portal" && a.domain === "mcp-personal.example.com");
+  assert.deepEqual(gate.policies, [{ id: "pol-1", precedence: 1 }]);
+  assert.equal(gate.oauth_configuration.dynamic_client_registration.allow_any_on_localhost, true, "agents sign in as they do to the main portal");
+  assert.equal(gate.session_duration, "24h");
+
+  let s = await state();
+  assert.deepEqual(s.collections, [
+    {
+      id: "personal",
+      name: "Personal",
+      endpoint: "https://mcp-personal.example.com/mcp",
+      code_mode: "opt_in",
+      integrations: [
+        { id: "notes", blocked_tools: [] },
+        { id: "garmin", blocked_tools: ["delete_record"] },
+      ],
+    },
+  ]);
+  assert.deepEqual(s.integrations.map((i: any) => i.collections), [["personal"], ["personal"], []]);
+
+  // Tools and code mode change in the collection alone.
+  await call("PUT", "/api/integrations/notes/tools", { tool: "search", enabled: false, collection: "personal" });
+  await call("PUT", "/api/portal", { code_mode: "enforced", collection: "personal" });
+  s = await state();
+  assert.deepEqual(s.collections[0].integrations[0].blocked_tools, ["search"]);
+  assert.equal(s.integrations[0].tools[0].enabled, true, "the main portal keeps the tool");
+  assert.deepEqual([s.collections[0].code_mode, s.portal.code_mode], ["enforced", "opt_in"]);
+
+  // Membership: add keeps everyone else's settings, remove takes one out.
+  assert.equal((await call("PUT", "/api/collections/personal", { add: ["linear"], remove: ["garmin"] })).status, 200);
+  assert.deepEqual(fake.portals.get("runkle-personal").servers.map((m: any) => [m.server_id, m.updated_tools.length]), [["notes", 1], ["linear", 0]]);
+  assert.equal((await call("PUT", "/api/collections/personal", { add: ["nope"] })).status, 400);
+  assert.equal((await call("POST", "/api/collections", { name: "personal" })).status, 400, "one collection per name");
+  assert.equal((await call("POST", "/api/collections", { name: "Work", integrations: ["nope"] })).status, 400);
+  assert.ok(!fake.portals.has("runkle-work"), "a refused collection makes nothing");
+
+  // Removing an integration takes it out of every collection first.
+  await call("DELETE", "/api/integrations/linear");
+  assert.deepEqual(fake.portals.get("runkle-personal").servers.map((m: any) => m.server_id), ["notes"]);
+
+  // A collection that fails halfway leaves nothing behind.
+  const before = { dns: fake.dns.size, apps: fake.apps.size };
+  fake.portals.set("other", { id: "other", name: "Hand-made", hostname: "mcp-work.example.com", servers: [] });
+  assert.equal((await call("POST", "/api/collections", { name: "Work" })).status, 502);
+  assert.deepEqual([fake.dns.size, fake.apps.size, fake.portals.has("runkle-work")], [before.dns, before.apps, false]);
+
+  // runkle deletes only collections it made, never the main portal or another one.
+  assert.equal((await call("DELETE", "/api/collections/main")).status, 400);
+  assert.equal((await call("DELETE", "/api/collections/other")).status, 400);
+  assert.equal((await call("DELETE", "/api/collections/personal")).status, 200);
+  assert.ok(!fake.portals.has("runkle-personal") && fake.portals.has("main") && fake.portals.has("other"));
+  assert.ok(![...fake.dns.values()].some((r) => r.name === "mcp-personal.example.com"));
+  assert.ok(![...fake.apps.values()].some((a) => a.domain === "mcp-personal.example.com"));
+  assert.ok(fake.servers.has("notes"), "integrations outlive the collection");
+});
+
 test("refuses unauthenticated and cross-origin requests", async () => {
   const locked = { ...env, AUTH_DISABLED: undefined };
   assert.equal((await worker.fetch(new Request(origin + "/api/state"), locked, {} as ExecutionContext)).status, 401);
