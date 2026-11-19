@@ -213,5 +213,6 @@ export const changeApp = async (env: Env, id: string, input: any) =>
 
 // What an agent may do to a script's source: deploy it, or leave it for review when the script holds secrets.
 export const proposeChange = async (env: Env, ui: string, id: string, source: unknown) => proposeApp(env, await server(env, id), { source }, appDeps(env), ui);
+export const proposeSource = async (env: Env, ui: string, id: string, input: any) => proposeChange(env, ui, id, await sourceApp(input));
 export const reviewChange = async (env: Env, id: string) => proposal(env, await server(env, id));
 export const decideChange = async (env: Env, id: string, input: any) => decide(env, await server(env, id), input, appDeps(env));

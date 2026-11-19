@@ -80,6 +80,14 @@ is arbitrary script output.
 An HTTP API's credential is one shared Worker secret (`API_TOKEN`). Per-user
 OAuth exists only for MCP servers, where the portal does it.
 
+An API source can be read-only (`read_only`, GET operations only) and still
+carry the few writes it needs, named in `operations`. Fields named in `redact`
+are replaced with `[redacted]` in every response, at any depth, so an API that
+returns secrets (Dokploy returns an app's env) never hands them to an agent.
+`update_api_source` regenerates a source in place, keeping its id, secrets and
+portal registration; like any agent change to a script with secrets, it waits
+for review.
+
 ## Credential links
 
 An agent cannot be given a secret, so it asks for a link (`credentialLink`,
