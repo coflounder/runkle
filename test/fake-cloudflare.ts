@@ -137,6 +137,8 @@ export function fakeCloudflare() {
       return ok({ bindings: [...Object.keys(secrets).map((name) => ({ name, type: "secret_text" })), ...Object.entries(vars).map(([name, text]) => ({ name, type: "plain_text", text }))] });
     }
     if (script && key.endsWith("/secrets")) return (scripts.get(script)!.secrets[body.name] = body.text), ok({ name: body.name });
+    const secret = path.match(/\/secrets\/([^/]+)$/)?.[1];
+    if (script && secret && request.method === "DELETE") return secret in scripts.get(script)!.secrets ? (delete scripts.get(script)!.secrets[secret], ok(null)) : fail(404, "no such secret");
     if (script && key.endsWith("/schedules")) return (scripts.get(script)!.schedules = body), ok({ schedules: body });
     if (script && request.method === "DELETE") return scripts.delete(script), ok(null);
     const [, worker, version] = path.match(/^\/workers\/workers\/(runkle-app-[^/]+)\/versions\/v(\d+)$/) ?? [];
@@ -180,6 +182,11 @@ export function fakeCloudflare() {
       return ok(servers.get(body.id));
     }
     if (serverId && key.endsWith("/sync")) return ok(servers.get(serverId));
+    if (serverId && request.method === "PUT") {
+      const { auth_credentials, ...rest } = body;
+      if (auth_credentials !== undefined) credentials.set(serverId, auth_credentials);
+      return Object.assign(servers.get(serverId), rest), ok(servers.get(serverId));
+    }
     if (serverId && request.method === "DELETE") return servers.delete(serverId), ok({ id: serverId });
     return fail(404, `no fake route for ${key}`);
   }

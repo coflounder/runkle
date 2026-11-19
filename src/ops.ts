@@ -1,8 +1,9 @@
 // Everything runkle can do, independent of how it is asked (web UI or MCP).
 
-import { appConfig, createApp, decide, deleteApp, isApp, pendingReview, proposal, proposeApp, scriptName, updateApp, type Deps } from "./apps.ts";
+import { appConfig, copyMark, createApp, decide, deleteApp, deleteSecret, isApp, keepCopy, pendingReview, proposal, proposeApp, scriptName, setSecret, updateApp, type Deps } from "./apps.ts";
 import { cf, cfRaw, UpstreamError, type Env } from "./cloudflare.ts";
 import * as health from "./health.ts";
+import { canon, describe, generateRequest, randomSecret } from "./generate.ts";
 import { inbox } from "./inbox.ts";
 import { expiryDate, httpsUrl, InputError, redirectUris, required, secretName, setTool, slug, toMapping, type Mapping } from "./mapping.ts";
 import { skillsApp, sourceApp } from "./sources.ts";
@@ -51,7 +52,7 @@ export async function state(env: Env, me: string) {
   const servers: any[] = portal.servers ?? [];
   // Which secrets each app has, by name, so an agent can tell when the user has entered them,
   // and which of its tools wait for the user's approval.
-  const config = await Promise.all(servers.map((s) => (isApp(s) ? appConfig(env, s.id).catch(() => ({ secrets: [], ask_first: [] })) : undefined)));
+  const config = await Promise.all(servers.map((s) => (isApp(s) ? appConfig(env, s.id).catch(() => ({ secrets: [], copied: [], ask_first: [] })) : undefined)));
   // ponytail: two Cloudflare calls per script on every load; fetch on demand if the list grows slow.
   const pending = await Promise.all(servers.map((s) => isApp(s) && pendingReview(env, s.id).catch(() => false)));
   const expiries = await inbox(env.INBOX)("expiries");
@@ -65,7 +66,7 @@ export async function state(env: Env, me: string) {
       url: s.hostname,
       auth_type: s.auth_type,
       is_app: isApp(s),
-      ...(config[i] && { secrets_set: config[i].secrets, ask_first: config[i].ask_first }),
+      ...(config[i] && { secrets_set: config[i].secrets, secrets_copied: config[i].copied, ask_first: config[i].ask_first }),
       ...(expiries[s.id] && { secret_expiry: expiries[s.id] }),
       ...(pending[i] && { pending_review: true }),
       auth_mode: s.auth_config_summary?.auth_mode,
@@ -196,7 +197,7 @@ const appDeps = (env: Env, ui: string): Deps => ({
   async pagesAud(id, host) {
     const [portal, apps] = await Promise.all([getPortal(env), accessApps(env)]);
     const find = (domain: string) => apps.find((a) => a.type === "self_hosted" && a.domain === domain);
-    const open = ["mcp", "webhooks", "manifest"].map((area) => `${host}/${area}`);
+    const open = ["mcp", "webhooks", "manifest", "vault"].map((area) => `${host}/${area}`);
     if (!find(open[0]))
       await cf(env, "POST", "/access/apps", {
         name: `${id} public paths`,
@@ -292,6 +293,85 @@ export const checkIntegrations = (env: Env) => healthReport(env);
 export const checkAndAlert = async (env: Env, ui?: string) => health.alert(env, await healthReport(env), ui);
 // The last report, or {} before the first check.
 export const lastHealth = async (env: Env) => (await inbox(env.INBOX)("health")) ?? {};
+
+// ---- Generated secrets ----
+//
+// runkle makes the value, keeps a copy in a vault if asked, and sets it where
+// it is used. It never stores the value, never returns it, and asked by an
+// agent it waits for a person: the request is an `approval` item in the inbox,
+// and the agent's repeated call runs once after it is approved. `by` is the
+// person when they ask from runkle's own UI, which needs no second approval.
+export async function generateSecret(env: Env, ui: string, input: unknown, by?: string) {
+  const request = generateRequest(input);
+  const servers: any[] = (await getPortal(env)).servers ?? [];
+  const find = (id: string) => servers.find((s) => s.id === id);
+
+  // Every rule is checked before anyone is asked, so a person only sees requests that can run.
+  const apps = [...new Set(request.targets.flatMap((t) => ("app" in t ? [t.app] : [])))];
+  const configs: Record<string, Awaited<ReturnType<typeof appConfig>>> = {};
+  for (const id of [...apps, ...(request.copy_to ? [request.copy_to.app] : [])]) {
+    if (!find(id) || !isApp(find(id))) throw new InputError(`No script or API named "${id}"`);
+    if (await pendingReview(env, id)) throw new InputError(`A change to ${id} is waiting for review. It must be approved or rejected first.`);
+    configs[id] = await appConfig(env, id);
+  }
+  for (const t of request.targets) {
+    if (!("server" in t)) continue;
+    const s = find(t.server);
+    if (!s || isApp(s)) throw new InputError(`No remote MCP server named "${t.server}". A script's own token is runkle's to manage.`);
+    if (s.auth_type !== "bearer") throw new InputError(`${t.server} does not sign in with a bearer token`);
+  }
+  // The vault app is handed the value, so its code must be code a person reviewed:
+  // an app's code changes wait for review only while it holds secrets.
+  if (request.copy_to && !configs[request.copy_to.app].secrets.length)
+    throw new InputError(`${request.copy_to.app} holds no secrets, so its code is not reviewed and it cannot keep copies`);
+
+  if (!by) {
+    const id = await sha(`runkle\ngenerate_secret\n${canon(request)}`);
+    const unreviewed = apps.filter((a) => !configs[a].secrets.length);
+    const ask = await inbox(env.INBOX)("ask", { id, app: "runkle", tool: "generate_secret", input: request, summary: describe(request, unreviewed), ui });
+    if (ask.state === "denied") throw new InputError(`Denied by ${ask.by}. Do not ask again unless the user tells you to.`);
+    if (ask.state !== "approved")
+      return {
+        waiting_for_approval: `${ui}/#${new URLSearchParams({ inbox: id })}`,
+        expires: new Date(ask.expires).toISOString(),
+        next: `Not done: the user must approve this first, in their runkle inbox. ${ask.notified === undefined ? "They have not decided yet." : ask.notified ? "They have been notified." : "Give them the link."} Call generate_secret again with exactly the same arguments: it runs once they have approved.`,
+      };
+  }
+
+  // From here the value exists, in this function only.
+  const value = randomSecret(request.length, request.alphabet);
+  // The copy first: a value that is live somewhere is never one that exists nowhere else.
+  if (request.copy_to) await keepCopy(env, find(request.copy_to.app), request.copy_to, value);
+  const set: string[] = [];
+  try {
+    for (const t of request.targets) {
+      if ("server" in t) {
+        await cf(env, "PUT", `${mcp}/servers/${t.server}`, { name: find(t.server).name, auth_credentials: value });
+        set.push(`bearer token of ${t.server}`);
+      } else {
+        await setSecret(env, t.app, t.secret, value);
+        if (request.copy_to) await setSecret(env, t.app, copyMark(t.secret), "1");
+        else if (configs[t.app].copied.includes(t.secret)) await deleteSecret(env, t.app, copyMark(t.secret));
+        set.push(`${t.secret} on ${t.app}`);
+      }
+    }
+  } catch (error) {
+    const left = request.copy_to ? " The vault holds the value, so it can be set by hand from there." : "";
+    throw new UpstreamError(`Set ${set.length ? set.join(", ") : "nothing"}, then failed: ${(error as Error).message.replaceAll(value, "[the generated value]")}.${left}`);
+  }
+  for (const app of apps) await inbox(env.INBOX)("close", { id: `secrets:${app}`, state: "done" });
+  return {
+    set,
+    ...(request.copy_to && { copy: { vault: request.copy_to.vault, item: request.copy_to.item, field: request.copy_to.field } }),
+    next: "Done. Nobody has seen the value. list_integrations shows the names in secrets_set, and in secrets_copied where a vault keeps a copy.",
+  };
+}
+
+const sha = async (text: string) =>
+  [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))]
+    .slice(0, 16)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 
 // ---- The inbox, for the person (UI only) ----
 
