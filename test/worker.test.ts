@@ -1257,3 +1257,59 @@ test("Fastmail: reading and drafting pass straight through, sending and changing
   assert.match((await approved("call", { tool: "delete_email", arguments: { emailId: "m1" } }, /delete_email\. emailId: m1/)).error, /No such email/);
   assert.equal(ran.length, 4);
 });
+
+test("Google Tasks: signs in on its own page, refreshes its token, and asks before deleting", async (t) => {
+  const fake = fakeCloudflare();
+  const google: any[] = [];
+  let issued = 0;
+  t.mock.method(globalThis, "fetch", async (input: any, init: any) => {
+    const request = new Request(input, init), url = new URL(request.url);
+    if (url.host === "oauth2.googleapis.com") {
+      const form = new URLSearchParams(await request.text());
+      assert.equal(form.get("client_secret"), "g-secret");
+      if (form.get("grant_type") === "authorization_code") {
+        if (form.get("code") !== "good-code") return Response.json({ error: "invalid_grant" }, { status: 400 });
+        assert.match(form.get("redirect_uri")!, /^https:\/\/runkle-app-.*\.acme\.workers\.dev\/webhooks\/callback$/);
+        return Response.json({ access_token: "at" + ++issued, expires_in: 1, refresh_token: "rt" });
+      }
+      assert.equal(form.get("refresh_token"), "rt");
+      return Response.json({ access_token: "at" + ++issued, expires_in: 3600 });
+    }
+    if (url.host !== "tasks.googleapis.com") return fake.handle(request);
+    google.push({ method: request.method, path: url.pathname, query: Object.fromEntries(url.searchParams), auth: request.headers.get("Authorization"), body: request.body ? await request.json() : undefined });
+    if (request.method === "DELETE") return new Response(null, { status: 204 });
+    if (url.pathname.endsWith("/users/@me/lists")) return Response.json({ items: [{ id: "L1", title: "My Tasks", updated: "x" }] });
+    if (request.method === "GET") return Response.json({ items: [{ id: "T1", title: "Buy milk", due: "2026-11-20T00:00:00.000Z", status: "needsAction", etag: "e", kind: "k" }] });
+    return Response.json({ id: "T2", title: "x", status: "needsAction", ...(google.at(-1).body as any) });
+  });
+  const { made, tool, page, approved } = await readyMade(fake, "google-tasks.js", "Google Tasks", { GOOGLE_CLIENT_ID: "g-id", GOOGLE_CLIENT_SECRET: "g-secret" });
+  assert.deepEqual(made.approvals.sort(), ["delete_task", "delete_tasklist"]);
+
+  assert.match((await tool("list_tasklists")).error, /not signed in yet.*\/pages\/connect/);
+  const connect = await (await page("/pages/connect")).text();
+  const consent = new URL(connect.match(/href="([^"]+)"/)![1].replace(/&amp;/g, "&"));
+  assert.equal(consent.searchParams.get("scope"), "https://www.googleapis.com/auth/tasks");
+  assert.equal(consent.searchParams.get("access_type"), "offline");
+  const state = consent.searchParams.get("state")!;
+
+  assert.equal((await page("/webhooks/callback?state=forged&code=good-code")).status, 400, "only a state the page made counts");
+  assert.equal((await page(`/webhooks/callback?state=${state}&code=good-code`)).status, 200);
+  assert.equal((await page(`/webhooks/callback?state=${state}&code=good-code`)).status, 400, "a state works once");
+
+  assert.deepEqual(await tool("list_tasklists"), [{ id: "L1", title: "My Tasks", updated: "x" }]);
+  assert.equal(google.at(-1).auth, "Bearer at2", "the first token had expired, so it refreshed");
+  assert.deepEqual(await tool("list_tasks", { due_max: "2026-11-30" }), [{ id: "T1", title: "Buy milk", due: "2026-11-20", status: "needsAction" }]);
+  assert.equal(google.at(-1).path, "/tasks/v1/lists/%40default/tasks");
+  assert.equal(google.at(-1).query.dueMax, "2026-11-30T23:59:59.999Z");
+  await tool("add_task", { title: "Call vet", due: "2026-11-21" });
+  assert.deepEqual(google.at(-1).body, { title: "Call vet", due: "2026-11-21T00:00:00.000Z" });
+  await tool("update_task", { tasklist: "L1", task: "T1", completed: true });
+  assert.deepEqual([google.at(-1).method, google.at(-1).body], ["PATCH", { status: "completed" }]);
+  assert.equal(issued, 2, "the refreshed token is reused");
+
+  const before = google.length;
+  assert.ok((await tool("delete_task", { task: "T1", title: "Buy milk" })).waiting_for_approval);
+  assert.equal(google.length, before, "nothing was deleted");
+  assert.equal(await approved("delete_task", { task: "T1", title: "Buy milk" }, /Delete the Google task "Buy milk"/), "deleted");
+  assert.equal(google.at(-1).method, "DELETE");
+});
