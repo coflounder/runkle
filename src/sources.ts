@@ -98,8 +98,26 @@ async function send(method, url, headers, body, env) {
   }
   const res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await res.text();
-  if (!res.ok) throw new Error("HTTP " + res.status + ": " + text.slice(0, 2000));
-  return text;
+  if (!res.ok) throw new Error("HTTP " + res.status + ": " + redact(text).slice(0, 2000));
+  return redact(text);
+}
+
+// Replace the value of every field named in config.redact, at any depth, so
+// secrets an API returns (an app's env, a database password) never reach the agent.
+function redact(text) {
+  if (!config.redact.length) return text;
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  const hide = (node) => {
+    if (Array.isArray(node)) return node.map(hide);
+    if (!node || typeof node !== "object") return node;
+    return Object.fromEntries(Object.entries(node).map(([k, v]) => [k, config.redact.includes(k.toLowerCase()) && v != null && v !== "" ? "[redacted]" : hide(v)]));
+  };
+  return JSON.stringify(hide(doc));
 }
 
 const rest = (op) => (input, env) => {
@@ -148,6 +166,9 @@ export async function sourceApp(input: any): Promise<string> {
     secretHeaders[header] = secretName(secret);
   }
 
+  const named = [].concat(input.operations ?? []).map((n: unknown) => String(n).trim()).filter(Boolean);
+  const redact = [].concat(input.redact ?? []).map((n: unknown) => String(n).trim().toLowerCase()).filter(Boolean);
+
   let config: { base?: string; ops: Op[]; graphql?: boolean };
   if (input.kind === "graphql") config = { base: httpsUrl(input.url, "GraphQL endpoint"), ops: [], graphql: true };
   else if (input.kind === "openapi" || input.kind === "discovery") {
@@ -168,14 +189,18 @@ export async function sourceApp(input: any): Promise<string> {
       }
     }
     config = input.kind === "openapi" ? openapi(doc, input.url || undefined, input.base_url) : discovery(doc, input.base_url);
+    const missing = named.filter((n) => !config.ops.some((op) => op.name === n));
+    if (missing.length) throw new InputError(`No such operation: ${missing.join(", ")}`);
+    // Named operations are always kept, so a read-only import can still carry the few writes it needs.
+    const keep = (op: Op) => named.includes(op.name);
     const filter = String(input.filter ?? "").trim().toLowerCase();
-    if (filter) config.ops = config.ops.filter((op) => `${op.name} ${op.path}`.toLowerCase().includes(filter));
-    if (input.read_only) config.ops = config.ops.filter((op) => op.method === "GET");
+    if (filter) config.ops = config.ops.filter((op) => keep(op) || `${op.name} ${op.path}`.toLowerCase().includes(filter));
+    if (input.read_only) config.ops = config.ops.filter((op) => keep(op) || op.method === "GET");
     if (!config.ops.length) throw new InputError("No operations found");
   } else throw new InputError("Pick a format");
 
   config.base = httpsUrl(config.base, "The API's base URL");
-  const source = `const config = ${JSON.stringify({ ...config, auth, secretHeaders })};\n${CLIENT}`;
+  const source = `const config = ${JSON.stringify({ ...config, auth, secretHeaders, redact })};\n${CLIENT}`;
   // ponytail: every schema is inlined, so a huge API has to be narrowed with `filter`. Share schemas if that bites.
   if (source.length > 1_000_000)
     throw new InputError(`This API is too large to import whole (${config.ops.length} operations). Narrow it with a filter such as a path prefix.`);

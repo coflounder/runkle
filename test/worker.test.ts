@@ -320,6 +320,14 @@ test("OpenAPI, Google Discovery and GraphQL sources become tools", async (t) => 
   await callTool(fake, "runkle-app-multi", "getPet", { petId: "1" });
   assert.deepEqual([sent[3].headers.get("x-api-key"), sent[3].headers.get("cf-access-client-id")], ["k", "c"]);
 
+  // A read-only import can still carry the writes named in operations, and redact hides fields the API returns.
+  const deploys = await call("POST", "/api/sources", { name: "Deploys", kind: "openapi", spec: OPENAPI, auth: "none", read_only: true, operations: ["createPet"], redact: ["OK"] });
+  assert.deepEqual(((await deploys.json()) as any).tools, ["getPet", "createPet"]);
+  assert.equal((await callTool(fake, "runkle-app-deploys", "createPet", { body: { name: "Rex" } })).text, '{"ok":"[redacted]"}');
+  assert.equal(sent.length, 5);
+  sent.pop();
+  assert.equal((await call("POST", "/api/sources", { name: "A", kind: "openapi", spec: OPENAPI, auth: "none", operations: ["nope"] })).status, 400);
+
   // Added by an agent, so no credential yet: calls say what is missing instead of going out unauthenticated.
   await call("POST", "/api/sources", { name: "Graph", kind: "graphql", url: "https://api.example.com/graphql", auth: "bearer" });
   assert.deepEqual((await rpc(fake, "runkle-app-graph", "tools/list")).tools.map((x: any) => x.name), ["query", "schema"]);
@@ -424,4 +432,22 @@ test("an agent's change to a script that holds secrets waits for a person", asyn
   assert.equal((await decide(third.version, true)).status, 200);
   assert.ok(live().endsWith("// v3"));
   assert.equal(fake.scripts.get("runkle-app-bare")!.secrets.KEY, "s3cret");
+});
+
+test("an agent regenerates an API source in place, held for review when it has secrets", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  const { proposeSource } = await import("../src/ops.ts");
+  const live = () => fake.scripts.get("runkle-app-pets")!.modules["app.js"];
+  await call("POST", "/api/sources", { name: "Pets", kind: "openapi", spec: OPENAPI, auth: "none", read_only: true, secret_headers: { "x-api-key": "API_KEY" } });
+  await call("PUT", "/api/apps/pets", { secrets: { API_KEY: "k" } });
+
+  const held: any = await proposeSource(env, origin, "pets", { kind: "openapi", spec: OPENAPI, auth: "none", read_only: true, operations: ["createPet"], secret_headers: { "x-api-key": "API_KEY" } });
+  assert.equal(held.waiting_for_review, "https://runkle.test/#review=pets");
+  assert.ok(!live().includes("createPet"), "the approved import keeps serving");
+  const seen: any = await (await call("GET", "/api/apps/pets/proposal")).json();
+  assert.ok(seen.proposed.includes("createPet"));
+  assert.equal((await call("POST", "/api/apps/pets/proposal", { version: seen.version, approve: true })).status, 200);
+  assert.ok(live().includes("createPet"));
+  assert.equal(fake.scripts.get("runkle-app-pets")!.secrets.API_KEY, "k");
 });

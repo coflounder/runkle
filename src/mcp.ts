@@ -80,23 +80,33 @@ function createServer(env: Env, ui: string) {
     },
     ({ id, source }) => run(() => ops.proposeChange(env, ui, id, source)),
   );
+  const sourceInput = {
+    kind: z.enum(["openapi", "discovery", "graphql"]),
+    url: z.string().describe("https:// URL of the OpenAPI or Discovery document (JSON or YAML), or of the GraphQL endpoint"),
+    base_url: z.string().optional().describe("Overrides the base URL the document declares"),
+    filter: z.string().optional().describe("Keep only operations whose name or path contains this text. Needed for very large APIs."),
+    auth: z.enum(["none", "bearer", "header", "query"]),
+    auth_name: z.string().optional().describe("Header or query parameter name, for auth header or query"),
+    secret_headers: z.record(z.string(), z.string()).optional().describe("For APIs that need more than one credential: header name -> name of the secret that fills it, e.g. {\"x-api-key\": \"API_KEY\"}. Names only; the user sets the values through request_credentials."),
+    read_only: z.boolean().optional().describe("Import only GET operations, plus any named in operations"),
+    operations: z.array(z.string()).optional().describe("Operations to import by name whatever filter and read_only say, e.g. the few writes a read-only import needs"),
+    redact: z.array(z.string()).optional().describe("Response fields whose values are replaced with [redacted] at any depth, e.g. [\"env\", \"password\"], so secrets the API returns never reach the agent"),
+  };
   server.registerTool(
     "add_api_source",
     {
       description: `Turn an HTTP API into an integration: one tool per operation for OpenAPI 3 and Google Discovery documents, or query and schema tools for a GraphQL endpoint. If the API needs a credential, say how it is sent with auth; the user then sets the API_TOKEN secret for it at ${ui}. Every user shares that one credential.`,
-      inputSchema: {
-        name: z.string(),
-        kind: z.enum(["openapi", "discovery", "graphql"]),
-        url: z.string().describe("https:// URL of the OpenAPI or Discovery document (JSON or YAML), or of the GraphQL endpoint"),
-        base_url: z.string().optional().describe("Overrides the base URL the document declares"),
-        filter: z.string().optional().describe("Keep only operations whose name or path contains this text. Needed for very large APIs."),
-        auth: z.enum(["none", "bearer", "header", "query"]),
-        auth_name: z.string().optional().describe("Header or query parameter name, for auth header or query"),
-        secret_headers: z.record(z.string(), z.string()).optional().describe("For APIs that need more than one credential: header name -> name of the secret that fills it, e.g. {\"x-api-key\": \"API_KEY\"}. Names only; the user sets the values through request_credentials."),
-        read_only: z.boolean().optional().describe("Import only GET operations"),
-      },
+      inputSchema: { name: z.string(), ...sourceInput },
     },
     (input) => run(() => ops.newSource(env, input)),
+  );
+  server.registerTool(
+    "update_api_source",
+    {
+      description: "Regenerate an HTTP API integration in place with new settings, such as more operations or fields to redact. Its id, secrets and portal registration are kept. If it holds secrets the change is not deployed: it waits until the user approves it at the link this returns. Call sync_integration once it is live.",
+      inputSchema: { id, ...sourceInput },
+    },
+    ({ id, ...input }) => run(() => ops.proposeSource(env, ui, id, input)),
   );
   const skills = z.array(z.object({ name: z.string().describe("lowercase-with-dashes"), description: z.string().describe("When an agent should read it"), content: z.string().describe("Markdown instructions") }));
   server.registerTool(
