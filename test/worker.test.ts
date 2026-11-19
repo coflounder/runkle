@@ -388,11 +388,11 @@ test("credential links name what to enter and carry no secret", async (t) => {
   assert.equal((await serverLink(env, origin, { name: "Gh", url: "https://gh.example/mcp", auth: "bearer" })).url, "https://runkle.test/#add=1&name=Gh&url=https%3A%2F%2Fgh.example%2Fmcp&auth=bearer");
   await assert.rejects(serverLink(env, origin, { name: "Gh", url: "http://gh.example", auth: "bearer" }), /https/);
 
-  // Both wait in the inbox until the person has done them.
-  const waiting = async () => ((await (await call("GET", "/api/inbox")).json()) as any).waiting.map((i: any) => [i.id, i.kind, i.link]);
+  // Both wait in the inbox until the person has done them. (Sorted: two items opened in the same millisecond have no order.)
+  const waiting = async () => ((await (await call("GET", "/api/inbox")).json()) as any).waiting.map((i: any) => [i.id, i.kind, i.link]).sort();
   assert.deepEqual(await waiting(), [
-    ["setup:gh", "setup", "https://runkle.test/#add=1&name=Gh&url=https%3A%2F%2Fgh.example%2Fmcp&auth=bearer"],
     ["secrets:garmin", "secrets", link.url],
+    ["setup:gh", "setup", "https://runkle.test/#add=1&name=Gh&url=https%3A%2F%2Fgh.example%2Fmcp&auth=bearer"],
   ]);
   await call("POST", "/api/integrations", { name: "Gh", url: "https://gh.example/mcp", auth: "none" });
 
