@@ -58,6 +58,7 @@ export const tools = {
   recent_activities: {
     description: "List my most recent Garmin activities",
     input: { type: "object", properties: { limit: { type: "number" } } }, // JSON Schema
+    annotations: { readOnlyHint: true }, // optional MCP tool annotations
     async run({ limit = 10 }, env) {
       const res = await fetch("https://example.com/activities?limit=" + limit, {
         headers: { Authorization: "Bearer " + env.GARMIN_TOKEN },
@@ -67,6 +68,13 @@ export const tools = {
   },
 };
 ```
+
+A tool may also declare `output`, a JSON Schema of what `run` returns, sent
+to agents as its `outputSchema`, and `annotations`, passed through as-is (MCP's
+`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). A plain
+object `run` returns reaches the agent both as text and as `structuredContent`.
+An argument whose name `input.properties` does not list is refused with an
+error naming the allowed ones, unless `input` sets `additionalProperties: true`.
 
 Choose **Add integration > Upload a script**, pick the file, and add the
 secrets it reads from `env`. runkle deploys it as a Worker named
@@ -128,7 +136,10 @@ Keep the Access policy on the runkle Worker to people you would give that to.
 
 Choose **Add integration > HTTP API** and give the address of an OpenAPI 3 or
 Google Discovery document (JSON or YAML), or upload it. Each operation becomes
-a tool. For a GraphQL endpoint you get two tools, `query` and `schema`.
+a tool, described by its summary or else by its method and path
+(`POST /compose.redeploy`), and marked read-only for GET, destructive for
+DELETE and idempotent for GET, PUT and DELETE. JSON responses come back
+structured. For a GraphQL endpoint you get two tools, `query` and `schema`.
 
 If the API needs a key, say how it is sent (bearer token, a named header, or a
 named query parameter) and enter it. It is stored as the integration's
@@ -260,12 +271,6 @@ npm run dev
 ```
 
 `AUTH_DISABLED` skips the Access check. It belongs in `.dev.vars` only.
-
-## Status
-
-Built from Cloudflare's published API reference and tested against a fake of
-that API. It has not yet been exercised against a live account; expect rough
-edges and please report them.
 
 ## License
 
