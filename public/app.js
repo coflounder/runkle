@@ -249,6 +249,56 @@ function integrationRow(i, open) {
       remove));
 }
 
+// One collection: its endpoint, which integrations it serves and which of their tools it blocks.
+function collectionRow(c, integrations, open) {
+  const members = new Map(c.integrations.map((m) => [m.id, m]));
+  const endpoint = h("input", { type: "text", readOnly: true, value: c.endpoint, id: `c-end-${c.id}`, ariaLabel: `${c.name} endpoint` });
+  const copy = h("button", { textContent: "Copy" });
+  copy.onclick = async () => { await navigator.clipboard.writeText(c.endpoint); copy.textContent = "Copied"; setTimeout(() => (copy.textContent = "Copy"), 1500); };
+  const rows = integrations.map((i) => {
+    const box = h("input", { type: "checkbox", checked: members.has(i.id), id: `c-${c.id}-${i.id}` });
+    box.onchange = () => act(box, () => api("PUT", `/api/collections/${c.id}`, box.checked ? { add: [i.id] } : { remove: [i.id] }));
+    const blocked = members.get(i.id)?.blocked_tools ?? [];
+    const tools = members.has(i.id) && i.tools.length
+      ? h("details", {}, h("summary", {}, h("small", {}, `${i.tools.length - blocked.length} of ${i.tools.length} tools on here`)),
+          ...i.tools.map((t) => {
+            const tool = h("input", { type: "checkbox", checked: !blocked.includes(t.name), id: `c-${c.id}-${i.id}-${t.name}` });
+            tool.onchange = () => act(tool, () => api("PUT", `/api/integrations/${i.id}/tools`, { tool: t.name, enabled: tool.checked, collection: c.id }));
+            return h("div", { className: "tool" }, tool, h("label", { htmlFor: tool.id }, h("code", {}, t.name)));
+          }))
+      : null;
+    return h("div", { className: "tool" }, box, h("label", { htmlFor: box.id }, i.name), tools);
+  });
+  const mode = h("select", {}, ...["off", "opt_in", "default_on", "enforced"].map((v) => h("option", { value: v, textContent: $("code-mode").querySelector(`[value=${v}]`).textContent })));
+  mode.value = c.code_mode || "opt_in";
+  mode.onchange = () => act(mode, () => api("PUT", "/api/portal", { code_mode: mode.value, collection: c.id }));
+  const remove = h("button", { className: "danger", textContent: "Delete collection" });
+  remove.onclick = () => {
+    if (remove.dataset.armed) return act(remove, () => api("DELETE", `/api/collections/${c.id}`));
+    remove.dataset.armed = "1";
+    remove.textContent = "Really delete? Agents connected to it lose access";
+    setTimeout(() => { delete remove.dataset.armed; remove.textContent = "Delete collection"; }, 4000);
+  };
+  return h("details", { className: "row", open, id: `c-${c.id}` },
+    h("summary", {}, h("span", { className: "grow wrap" }, h("strong", {}, c.name), h("br"), h("small", {}, c.endpoint)), h("small", {}, `${c.integrations.length} integrations`)),
+    h("div", { className: "copy tools" }, endpoint, copy),
+    h("pre", { className: "tools" }, `claude mcp add --transport http runkle-${c.id} ${c.endpoint}`),
+    h("div", { className: "tools" }, ...rows),
+    h("label", { className: "tools" }, "Code mode", mode),
+    h("div", { className: "actions" }, remove));
+}
+
+$("new-collection").onsubmit = (e) => {
+  e.preventDefault();
+  const f = e.target;
+  act(e.submitter, async () => {
+    const made = await api("POST", "/api/collections", { name: new FormData(f).get("name") });
+    f.reset();
+    $("notice").textContent = `Created ${made.endpoint}. Tick the integrations it serves, then add it to your agent as a new connector and sign in.`;
+    $("notice").hidden = false;
+  });
+};
+
 async function load() {
   const [s, , report] = await Promise.all([api("GET", "/api/state"), loadInbox(), api("GET", "/api/health")]);
   state = s;
@@ -258,6 +308,9 @@ async function load() {
   $("integrations").replaceChildren(...(s.integrations.length
     ? s.integrations.map((i) => integrationRow(i, open.has(`i-${i.id}`)))
     : [h("p", { className: "row muted" }, "Nothing connected yet. Add a remote MCP server or upload a script, and its tools show up here.")]));
+  const openCollections = new Set([...document.querySelectorAll("#collections details.row[open]")].map((d) => d.id));
+  $("collections").replaceChildren(...s.collections.map((c) => collectionRow(c, s.integrations, openCollections.has(`c-${c.id}`))));
+  $("collections").hidden = !s.collections.length;
   $("endpoint").value = s.endpoint;
   $("admin-endpoint").value = `${location.origin}/mcp`;
   $("snippet").textContent = `# Claude Code\nclaude mcp add --transport http runkle ${s.endpoint}\n\n# Anything else: add a remote (streamable HTTP) MCP server with this URL`;

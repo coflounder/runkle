@@ -1,7 +1,7 @@
 // Everything runkle can do, independent of how it is asked (web UI or MCP).
 
 import { appConfig, copyMark, createApp, decide, deleteApp, deleteSecret, isApp, keepCopy, pendingReview, proposal, proposeApp, scriptName, setSecret, updateApp, type Deps } from "./apps.ts";
-import { cf, cfRaw, UpstreamError, type Env } from "./cloudflare.ts";
+import { cf, cfRaw, cfZone, UpstreamError, type Env } from "./cloudflare.ts";
 import * as health from "./health.ts";
 import { canon, describe, generateRequest, randomSecret } from "./generate.ts";
 import { inbox } from "./inbox.ts";
@@ -18,11 +18,13 @@ async function accessApps(env: Env): Promise<any[]> {
 }
 
 const mcp = "/access/ai-controls/mcp";
-const getPortal = (env: Env) => cf(env, "GET", `${mcp}/portals/${env.PORTAL_ID}`);
+// The portal runkle was deployed with, which serves every integration, or a collection's.
+// It carries the id it was fetched by, which putPortal writes back to.
+const getPortal = async (env: Env, id = env.PORTAL_ID) => ({ ...(await cf(env, "GET", `${mcp}/portals/${id}`)), id });
 
 // A portal PUT resets whatever it is not sent, so always send everything.
 const putPortal = (env: Env, portal: any, changes: { servers?: Mapping[]; code_mode?: string }) =>
-  cf(env, "PUT", `${mcp}/portals/${env.PORTAL_ID}`, {
+  cf(env, "PUT", `${mcp}/portals/${portal.id}`, {
     name: portal.name,
     hostname: portal.hostname,
     ...(portal.description && { description: portal.description }),
@@ -47,7 +49,7 @@ const portalPolicies = (apps: any[], portal: any) =>
   (portalApp(apps, portal)?.policies ?? []).map((p: any, i: number) => ({ id: p.id, precedence: i + 1 }));
 
 export async function state(env: Env, me: string) {
-  const [portal, apps] = await Promise.all([getPortal(env), accessApps(env)]);
+  const [portal, apps, cols] = await Promise.all([getPortal(env), accessApps(env), collections(env)]);
   const oauth = portalApp(apps, portal)?.oauth_configuration;
   const servers: any[] = portal.servers ?? [];
   // Which secrets each app has, by name, so an agent can tell when the user has entered them,
@@ -60,6 +62,13 @@ export async function state(env: Env, me: string) {
     me,
     portal: { name: portal.name, hostname: portal.hostname, code_mode: portal.code_mode },
     endpoint: `https://${portal.hostname}/mcp`,
+    collections: cols.map((c) => ({
+      id: c.id.slice(COLLECTION.length),
+      name: c.name,
+      endpoint: `https://${c.hostname}/mcp`,
+      code_mode: c.code_mode,
+      integrations: (c.servers ?? []).map((s: any) => ({ id: s.id, blocked_tools: (s.tools ?? []).filter((t: any) => !toolEnabled(s, t)).map((t: any) => t.name) })),
+    })),
     integrations: servers.map((s, i) => ({
       id: s.id,
       name: s.name,
@@ -74,11 +83,8 @@ export async function state(env: Env, me: string) {
       authentication_status: s.authentication_status,
       error: s.error_details?.cause ?? s.error,
       last_synced: s.last_successful_sync,
-      tools: (s.tools ?? []).map((t: any) => ({
-        name: t.name,
-        description: t.description,
-        enabled: s.updated_tools?.find((u: any) => u.name === t.name)?.enabled ?? !s.default_disabled,
-      })),
+      collections: cols.filter((c) => c.servers?.some((x: any) => x.id === s.id)).map((c) => c.id.slice(COLLECTION.length)),
+      tools: (s.tools ?? []).map((t: any) => ({ name: t.name, description: t.description, enabled: toolEnabled(s, t) })),
     })),
     agentAuth: portalApp(apps, portal) && {
       enabled: oauth?.enabled ?? false,
@@ -88,6 +94,8 @@ export async function state(env: Env, me: string) {
     },
   };
 }
+
+const toolEnabled = (s: any, t: any) => s.updated_tools?.find((u: any) => u.name === t.name)?.enabled ?? !s.default_disabled;
 
 export type ServerBody = Record<string, unknown> & { id: string; name: string; auth_type: string };
 
@@ -122,17 +130,19 @@ export async function registerServer(env: Env, body: ServerBody) {
 }
 
 export async function removeIntegration(env: Env, id: string) {
-  const [portal, apps] = await Promise.all([getPortal(env), accessApps(env)]);
-  await putPortal(env, portal, { servers: toMapping(portal.servers ?? []).filter((m) => m.server_id !== id) });
+  const [portal, apps, cols] = await Promise.all([getPortal(env), accessApps(env), collections(env)]);
+  for (const c of [...cols, portal])
+    if (c.servers?.some((s: any) => s.id === id)) await putPortal(env, c, { servers: toMapping(c.servers).filter((m) => m.server_id !== id) });
   for (const app of serverApps(apps, id)) await cf(env, "DELETE", `/access/apps/${app.id}`);
   await cf(env, "DELETE", `${mcp}/servers/${id}`);
   if (portal.servers?.some((s: any) => s.id === id && isApp(s))) await deleteApp(env, id);
   await inbox(env.INBOX)("expiry", { app: id, forget: true });
 }
 
-export async function toggleTool(env: Env, id: string, input: { tool?: string; enabled?: boolean }) {
+// In the portal that serves everything, or with `collection`, in that collection only.
+export async function toggleTool(env: Env, id: string, input: { tool?: string; enabled?: boolean; collection?: string }) {
   if (typeof input.tool !== "string" || typeof input.enabled !== "boolean") throw new InputError("tool and enabled are required");
-  const portal = await getPortal(env);
+  const portal = input.collection ? await getCollection(env, input.collection) : await getPortal(env);
   // ponytail: read-modify-write, last write wins if two admins toggle at once. The API offers no per-tool PATCH.
   await putPortal(env, portal, { servers: setTool(toMapping(portal.servers ?? []), id, input.tool, input.enabled) });
 }
@@ -160,7 +170,129 @@ export async function setAgentAuth(env: Env, input: any) {
 
 export async function setCodeMode(env: Env, input: any) {
   if (!["off", "opt_in", "default_on", "enforced"].includes(input.code_mode)) throw new InputError("Unknown code mode");
-  await putPortal(env, await getPortal(env), { code_mode: input.code_mode });
+  await putPortal(env, input.collection ? await getCollection(env, input.collection) : await getPortal(env), { code_mode: input.code_mode });
+}
+
+// ---- Collections ----
+// A collection is one more portal, on its own hostname, serving some of the
+// integrations. runkle makes and runs every part of it: the portal, its DNS
+// record and its Access application. The portal runkle was deployed with keeps
+// serving everything, and every integration is registered there first.
+
+const COLLECTION = "runkle-"; // portal ids runkle owns; any other portal is left alone
+const DNS_COMMENT = (id: string) => `runkle collection ${id}`;
+// Where a portal's hostname points, if the deployed portal's own record can't be read.
+const PORTAL_TARGET = "gateway.agents.cloudflare.com";
+
+const listPortals = (env: Env): Promise<any[]> => cf(env, "GET", `${mcp}/portals`);
+
+// Each collection in full, with its servers. A list of portals leaves them out.
+async function collections(env: Env): Promise<any[]> {
+  const ids = (await listPortals(env)).map((p) => p.id).filter((id: string) => id?.startsWith(COLLECTION));
+  return Promise.all(ids.map((id) => getPortal(env, id)));
+}
+
+async function getCollection(env: Env, id: unknown) {
+  if (typeof id !== "string" || !id) throw new InputError("collection is required");
+  const portalId = COLLECTION + id;
+  if (!(await listPortals(env)).some((p) => p.id === portalId)) throw new InputError(`No collection "${id}"`);
+  return getPortal(env, portalId);
+}
+
+// The deployed portal's entries for these integrations, tool settings included.
+function pick(portal: any, ids: string[]): Mapping[] {
+  const mapping = toMapping(portal.servers ?? []);
+  for (const id of ids) if (!mapping.some((m) => m.server_id === id)) throw new InputError(`No integration "${id}"`);
+  return mapping.filter((m) => ids.includes(m.server_id));
+}
+
+const ids = (list: unknown, name: string): string[] => {
+  if (list == null) return [];
+  if (!Array.isArray(list) || list.some((x) => typeof x !== "string")) throw new InputError(`${name} must be a list of integration ids`);
+  return [...new Set(list as string[])];
+};
+
+// The zone that holds a hostname: the longest of its suffixes that is a zone on this account.
+async function zoneFor(env: Env, hostname: string): Promise<string> {
+  const labels = hostname.split(".");
+  for (let i = 0; i < labels.length - 1; i++) {
+    const [zone] = await cfZone(env, "GET", `/zones?account.id=${env.ACCOUNT_ID}&name=${labels.slice(i).join(".")}`);
+    if (zone) return zone.id;
+  }
+  throw new UpstreamError(`No Cloudflare zone for ${hostname}. runkle's API token needs Zone Read and DNS Edit on it.`);
+}
+
+const dnsRecords = (env: Env, zone: string, name: string): Promise<any[]> => cfZone(env, "GET", `/zones/${zone}/dns_records?name=${name}`);
+
+export async function createCollection(env: Env, input: { name?: string; integrations?: unknown }) {
+  const name = required(input.name, "Name");
+  const id = slug(name).slice(0, 24).replace(/-+$/, "");
+  if (!id) throw new InputError("Name needs a letter or a digit");
+  const [main, apps, portals] = await Promise.all([getPortal(env), accessApps(env), listPortals(env)]);
+  if (portals.some((p) => p.id === COLLECTION + id)) throw new InputError(`A collection "${id}" already exists`);
+  const servers = pick(main, ids(input.integrations, "integrations"));
+  // One label under the deployed portal's domain, so its certificate covers it: mcp-personal.example.com.
+  const hostname = `mcp-${id}.${main.hostname.slice(main.hostname.indexOf(".") + 1)}`;
+  const zone = await zoneFor(env, hostname);
+
+  const undo: (() => Promise<unknown>)[] = [];
+  try {
+    if (!(await dnsRecords(env, zone, hostname)).length) {
+      const [like] = await dnsRecords(env, zone, main.hostname);
+      const record = await cfZone(env, "POST", `/zones/${zone}/dns_records`, {
+        type: like?.type ?? "CNAME",
+        name: hostname,
+        content: like?.content ?? PORTAL_TARGET,
+        proxied: true,
+        ttl: 1,
+        comment: DNS_COMMENT(id),
+      });
+      undo.push(() => cfZone(env, "DELETE", `/zones/${zone}/dns_records/${record.id}`));
+    }
+    await cf(env, "POST", `${mcp}/portals`, { id: COLLECTION + id, name, hostname, secure_web_gateway: main.secure_web_gateway ?? false, code_mode: main.code_mode, servers });
+    undo.push(() => cf(env, "DELETE", `${mcp}/portals/${COLLECTION + id}`));
+    // Signs people and agents in exactly as the deployed portal does. Looked up
+    // again in case Cloudflare made an app along with the portal.
+    const gate = portalApp(apps, main);
+    const settings = {
+      policies: portalPolicies(apps, main),
+      ...(gate?.session_duration && { session_duration: gate.session_duration }),
+      ...(gate?.oauth_configuration && { oauth_configuration: gate.oauth_configuration }),
+    };
+    const made = portalApp(await accessApps(env), { hostname });
+    if (made) await cf(env, "PUT", `/access/apps/${made.id}`, { ...made, ...settings });
+    else {
+      const app = await cf(env, "POST", "/access/apps", { name: `${name} (runkle collection)`, type: "mcp_portal", domain: hostname, destinations: [{ type: "public", uri: hostname }], ...settings });
+      undo.push(() => cf(env, "DELETE", `/access/apps/${app.id}`));
+    }
+  } catch (error) {
+    for (const step of undo.reverse()) await step().catch(() => {});
+    throw error;
+  }
+  return { id, endpoint: `https://${hostname}/mcp`, next_steps: COLLECTION_NEXT_STEPS };
+}
+
+export const COLLECTION_NEXT_STEPS =
+  "Agents reach a collection through its own endpoint: add it as a new connector in the MCP client (in claude.ai, under Settings > Connectors) and sign in. Integrations that sign each person in with OAuth ask for that sign-in again through the new connector.";
+
+// Integrations join with the settings they have in the deployed portal; leaving one changes nothing else.
+export async function setCollection(env: Env, id: string, input: { add?: unknown; remove?: unknown }) {
+  const [portal, main] = await Promise.all([getCollection(env, id), getPortal(env)]);
+  const remove = ids(input.remove, "remove");
+  const kept = toMapping(portal.servers ?? []).filter((m) => !remove.includes(m.server_id));
+  const add = ids(input.add, "add").filter((a) => !kept.some((m) => m.server_id === a));
+  await putPortal(env, portal, { servers: [...kept, ...pick(main, add)] });
+}
+
+// The portal first, so nothing is served while its sign-in is taken away.
+export async function deleteCollection(env: Env, id: string) {
+  const [portal, apps] = await Promise.all([getCollection(env, id), accessApps(env)]);
+  await cf(env, "DELETE", `${mcp}/portals/${portal.id}`);
+  const app = portalApp(apps, portal);
+  if (app) await cf(env, "DELETE", `/access/apps/${app.id}`);
+  const zone = await zoneFor(env, portal.hostname);
+  for (const record of await dnsRecords(env, zone, portal.hostname))
+    if (record.comment === DNS_COMMENT(id)) await cfZone(env, "DELETE", `/zones/${zone}/dns_records/${record.id}`);
 }
 
 
