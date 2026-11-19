@@ -11,6 +11,10 @@
 //   webhooks   public HTTP handlers at /webhooks/<name>
 //   pages      HTTP handlers at /pages/<name>, only behind Cloudflare Access
 //   workflows  durable multi-step functions, run by Cloudflare Workflows
+//   probe      an optional check that the app's secrets and upstream work,
+//              run when runkle checks integrations (/manifest/probe)
+//   vault      keeps a copy of a value runkle generated (generate_secret), at
+//              /vault, answered only for a key runkle sets for that one call
 //
 // A tool that needs a person's approval (named in RUNKLE_ASK, or carrying an
 // `approval` of its own) does not run when called. The call goes to runkle's
@@ -32,6 +36,7 @@ const schedules = app.schedules || {};
 const webhooks = app.webhooks || {};
 const pages = app.pages || {};
 const workflows = app.workflows || {};
+const vault = app.vault;
 
 if (Object.keys(skills).length)
   tools.skills = {
@@ -183,6 +188,34 @@ export default {
         workflows: Object.keys(workflows),
         approvals: Object.keys(tools).filter((n) => gated(env, n)),
       });
+    }
+
+    // runkle's health check. The key is one runkle put in its inbox for this request alone.
+    // Under /manifest, so an app whose pages sit behind Access still answers it.
+    if (path === "/manifest/probe") {
+      const key = (request.headers.get("Authorization") || "").replace(/^Bearer /, "");
+      if (!key || !env.RUNKLE_INBOX || !(await inbox(env, "probe_check", { app: env.RUNKLE_APP, key })).ok) return new Response("Unauthorized", { status: 401 });
+      if (typeof app.probe !== "function") return Response.json({ probed: false });
+      try {
+        await app.probe(secrets, ctx);
+        return Response.json({ probed: true, ok: true });
+      } catch (error) {
+        return Response.json({ probed: true, ok: false, error: String((error && error.message) || error).slice(0, 300) });
+      }
+    }
+
+    // runkle hands over a value it generated, to be kept in the app's vault. The
+    // app's code receives it only as this call's argument, never in its env.
+    if (path === "/vault") {
+      if (!(await authorized(request, env.RUNKLE_SETUP))) return new Response("Unauthorized", { status: 401 });
+      if (!vault || request.method !== "POST") return new Response("Not found", { status: 404 });
+      const { vault: name, item, field, value } = await request.json();
+      try {
+        await vault.save({ vault: name, item, field, value }, secrets, ctx);
+        return Response.json({ kept: true });
+      } catch (error) {
+        return Response.json({ error: String((error && error.message) || error) }, { status: 502 });
+      }
     }
 
     if (path !== "/mcp") return new Response("Not found", { status: 404 });
