@@ -6,7 +6,24 @@ import { parse } from "yaml";
 import { httpsUrl, InputError, secretName } from "./mapping.ts";
 
 type Param = { name: string; in: string; required?: boolean; schema?: object };
-type Op = { name: string; description: string; method: string; path: string; params: { name: string; in: string }[]; body: boolean; input: object };
+type Op = {
+  name: string;
+  description: string;
+  annotations: Record<string, boolean>;
+  method: string;
+  path: string;
+  params: { name: string; in: string }[];
+  body: boolean;
+  input: object;
+};
+
+// MCP tool annotations from the HTTP method. POST and PATCH say nothing about
+// destructiveness, because RPC-style APIs (Dokploy's /compose.delete) delete with POST.
+const hints = (method: string) => ({
+  readOnlyHint: method === "GET" || method === "HEAD",
+  ...(method === "DELETE" && { destructiveHint: true }),
+  ...(["GET", "HEAD", "PUT", "DELETE"].includes(method) && { idempotentHint: true }),
+});
 
 // Replace every $ref with what it points to. A schema that refers back to
 // itself becomes {} (anything) at the point of recursion.
@@ -23,10 +40,13 @@ function operation(id: string, description: unknown, method: string, path: strin
   if (body)
     properties.body = // ponytail: a parameter that is itself called "body" is shadowed
       JSON.stringify(body).length > 20_000 ? { type: "object", description: "Request body. Its schema is too large to list here; see the API's documentation." } : body;
+  method = method.toUpperCase();
   return {
     name: id.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64),
-    description: String(description ?? "").slice(0, 300),
-    method: method.toUpperCase(),
+    // Never empty: an agent searching hundreds of tools tells them apart by this.
+    description: (String(description ?? "").trim() || `${method} ${path}`).slice(0, 300),
+    annotations: hints(method),
+    method,
     path,
     params: params.map((p) => ({ name: p.name, in: p.in })),
     body: Boolean(body),
@@ -47,7 +67,7 @@ function openapi(doc: any, specUrl?: string, baseUrl?: string) {
         .filter((p: any) => ["path", "query", "header"].includes(p.in))
         .map((p: any) => ({ name: p.name, in: p.in, required: p.required, schema: { ...p.schema, ...(p.description && { description: p.description }) } }));
       const body = inline(op.requestBody, lookup)?.content?.["application/json"]?.schema;
-      ops.push(operation(op.operationId ?? `${method}_${path}`, op.summary ?? op.description, method, path, params, body));
+      ops.push(operation(op.operationId ?? `${method}_${path}`, String(op.summary ?? "").trim() || op.description, method, path, params, body));
     }
   let base: string | undefined;
   try {
@@ -97,15 +117,16 @@ async function send(method, url, headers, body, env) {
     headers[name] = env[secret];
   }
   const res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-  const text = await res.text();
-  if (!res.ok) throw new Error("HTTP " + res.status + ": " + redact(text).slice(0, 2000));
-  return redact(text);
+  const out = decode(await res.text());
+  if (!res.ok) throw new Error("HTTP " + res.status + ": " + (typeof out === "string" ? out : JSON.stringify(out)).slice(0, 2000));
+  return out;
 }
 
-// Replace the value of every field named in config.redact, at any depth, so
-// secrets an API returns (an app's env, a database password) never reach the agent.
-function redact(text) {
-  if (!config.redact.length) return text;
+// A JSON response is returned parsed, so the agent gets it as structured
+// content. The value of every field named in config.redact is replaced at any
+// depth, so secrets an API returns (an app's env, a database password) never
+// reach the agent.
+function decode(text) {
   let doc;
   try {
     doc = JSON.parse(text);
@@ -117,7 +138,7 @@ function redact(text) {
     if (!node || typeof node !== "object") return node;
     return Object.fromEntries(Object.entries(node).map(([k, v]) => [k, config.redact.includes(k.toLowerCase()) && v != null && v !== "" ? "[redacted]" : hide(v)]));
   };
-  return JSON.stringify(hide(doc));
+  return config.redact.length ? hide(doc) : doc;
 }
 
 const rest = (op) => (input, env) => {
@@ -144,13 +165,14 @@ const graphql = {
   },
   schema: {
     description: "List the GraphQL schema's types with their fields and arguments.",
+    annotations: { readOnlyHint: true },
     run: (input, env) => post({ query: "{ __schema { queryType { name } mutationType { name } types { name kind description fields { name description args { name type { name kind ofType { name kind } } } type { name kind ofType { name kind } } } inputFields { name type { name kind ofType { name kind } } } enumValues { name } } } }" }, env),
   },
 };
 
 export const tools = config.graphql
   ? graphql
-  : Object.fromEntries(config.ops.map((op) => [op.name, { description: op.description, input: op.input, run: rest(op) }]));
+  : Object.fromEntries(config.ops.map((op) => [op.name, { description: op.description, annotations: op.annotations, input: op.input, run: rest(op) }]));
 `;
 
 export async function sourceApp(input: any): Promise<string> {

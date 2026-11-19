@@ -2,7 +2,10 @@
 // exports into a Worker:
 //
 //   tools      MCP tools at /mcp (stateless streamable HTTP, JSON responses),
-//              answered only for the portal's bearer token
+//              answered only for the portal's bearer token. A tool may declare
+//              annotations and an output schema; a plain object it returns is
+//              also sent as structuredContent; arguments its input schema does
+//              not name are refused
 //   skills     instructions for agents, served through a `skills` tool
 //   schedules  cron handlers
 //   webhooks   public HTTP handlers at /webhooks/<name>
@@ -31,6 +34,7 @@ if (Object.keys(skills).length)
       "Read one of this integration's skills (instructions for a task) by name. Available: " +
       Object.entries(skills).map(([name, s]) => name + (s.description ? " (" + s.description + ")" : "")).join("; "),
     input: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+    annotations: { readOnlyHint: true },
     run({ name }) {
       if (!Object.hasOwn(skills, name)) throw new Error("Unknown skill: " + name);
       return skills[name].content;
@@ -69,6 +73,14 @@ export class Flow extends WorkflowEntrypoint {
     return workflows[name](step, input, ...parts(this.env));
   }
 }
+
+// Argument names the tool's input schema does not list, unless it allows any.
+// A schema that lists no properties says nothing about names, so it allows any.
+function unknownArgs(schema, args) {
+  if (!schema || !schema.properties || schema.additionalProperties === true) return [];
+  return Object.keys(args).filter((name) => !Object.hasOwn(schema.properties, name));
+}
+const isPlainObject = (value) => value !== null && typeof value === "object" && [Object.prototype, null].includes(Object.getPrototypeOf(value));
 
 const reply = (id, result) => Response.json({ jsonrpc: "2.0", id, result });
 const fail = (id, code, message) => Response.json({ jsonrpc: "2.0", id, error: { code, message } });
@@ -149,15 +161,25 @@ export default {
             name,
             description: t.description || "",
             inputSchema: t.input || { type: "object" },
+            ...(t.output && { outputSchema: t.output }),
+            ...(t.annotations && { annotations: t.annotations }),
           })),
         });
       case "tools/call": {
         const name = msg.params && msg.params.name;
         if (!Object.hasOwn(tools, name)) return fail(msg.id, -32602, "Unknown tool: " + name);
+        const args = msg.params.arguments || {};
+        const unknown = unknownArgs(tools[name].input, args);
+        if (unknown.length) {
+          const allowed = Object.keys(tools[name].input.properties);
+          const text = "Unknown argument" + (unknown.length > 1 ? "s: " : ": ") + unknown.join(", ") + ". " + name + " takes " + (allowed.length ? allowed.join(", ") : "no arguments") + ".";
+          return reply(msg.id, { content: [{ type: "text", text }], isError: true });
+        }
         try {
-          const out = await tools[name].run(msg.params.arguments || {}, secrets, ctx);
+          const out = await tools[name].run(args, secrets, ctx);
           const text = typeof out === "string" ? out : JSON.stringify(out === undefined ? null : out);
-          return reply(msg.id, { content: [{ type: "text", text }] });
+          // Agents read a plain object as structured content instead of parsing the text.
+          return reply(msg.id, { content: [{ type: "text", text }], ...(isPlainObject(out) && { structuredContent: JSON.parse(text) }) });
         } catch (error) {
           return reply(msg.id, { content: [{ type: "text", text: String((error && error.message) || error) }], isError: true });
         }

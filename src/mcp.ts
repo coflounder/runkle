@@ -17,6 +17,8 @@ export const tools = {
   tool_name: {
     description: "What it does",
     input: { type: "object", properties: { days: { type: "number" } } }, // JSON Schema
+    output: { type: "object", properties: { any: { type: "string" } } }, // optional JSON Schema of what run returns
+    annotations: { readOnlyHint: true }, // optional MCP tool annotations, passed through as-is
     async run(input, env, ctx) { return { any: "JSON" }; },
   },
 };
@@ -29,13 +31,20 @@ export const workflows = { name: async (step, input, env, ctx) => step.do("first
 env holds the script's secrets. ctx.storage has get(key), put(key, value), delete(key) and list(prefix), all async and durable.
 ctx.workflows has start(name, input), which returns an id, and status(id).
 ctx.origin is the script's own address inside tools, webhooks and pages: a page is at ctx.origin + "/pages/<name>".
+A tool that returns a plain object also returns it as structuredContent. Arguments input.properties does not name are refused unless input sets additionalProperties: true.
 It runs as a Cloudflare Worker: fetch and Web APIs are available, npm imports are not.`;
+
+const USING_THE_PORTAL = `Using this portal: tools of runkle apps (scripts and HTTP APIs) return JSON objects as structuredContent beside the text, so read that instead of parsing the text, and they refuse argument names their input schema does not list. When retrying a write on a server that takes a request or idempotency id, reuse the same id so the write is not done twice. A long write may answer that it is queued: check its status instead of calling it again. For the user's integrations, prefer this portal's tools over other connectors that reach the same service.`;
+
+// Returned by every tool that adds an integration.
+const NEXT_STEPS =
+  "A new integration's tools reach agents only after the user reconnects this portal's connector in their MCP client (in claude.ai, under Settings > Connectors) and starts a fresh session. Growing an existing integration in place with update_api_source or update_script avoids that.";
 
 function createServer(env: Env, ui: string) {
   const server = new McpServer(
     { name: "runkle", version: "1.0.0" },
     {
-      instructions: `Manage the integrations served by this runkle portal. Never ask the user for a password, token or API key and never put one in a script: declare what the script reads from \`env\`, then give the user the link from request_credentials so they can enter the values themselves. For an MCP server that needs an access token or its own OAuth client, give them the link from request_mcp_server_setup.\n\n${SCRIPT_FORMAT}`,
+      instructions: `Manage the integrations served by this runkle portal. Never ask the user for a password, token or API key and never put one in a script: declare what the script reads from \`env\`, then give the user the link from request_credentials so they can enter the values themselves. For an MCP server that needs an access token or its own OAuth client, give them the link from request_mcp_server_setup.\n\n${USING_THE_PORTAL}\n\n${SCRIPT_FORMAT}`,
     },
   );
 
@@ -49,6 +58,7 @@ function createServer(env: Env, ui: string) {
       throw error;
     }
   };
+  const added = (fn: () => Promise<object>) => run(async () => ({ ...(await fn()), next_steps: NEXT_STEPS }));
   const id = z.string().describe("Integration id from list_integrations");
 
   server.registerTool(
@@ -62,7 +72,7 @@ function createServer(env: Env, ui: string) {
       description: "Register a remote MCP server by URL. Use auth \"oauth\" when the server needs each user to sign in; servers that need an access token must be added in the web UI.",
       inputSchema: { name: z.string(), url: z.string().describe("https:// URL of the MCP endpoint"), auth: z.enum(["none", "oauth"]) },
     },
-    (input) => run(() => ops.registerServer(env, serverBody(input))),
+    (input) => added(() => ops.registerServer(env, serverBody(input))),
   );
   server.registerTool(
     "upload_script",
@@ -70,7 +80,7 @@ function createServer(env: Env, ui: string) {
       description: `Deploy a script as a new integration. Returns its id and what it exports, with the URLs of its webhooks and pages. Secrets it reads from env must then be set by the user at ${ui}.\n\n${SCRIPT_FORMAT}`,
       inputSchema: { name: z.string(), source: z.string().describe("The module source") },
     },
-    ({ name, source }) => run(() => ops.newApp(env, { name, source })),
+    ({ name, source }) => added(() => ops.newApp(env, { name, source })),
   );
   server.registerTool(
     "update_script",
@@ -98,7 +108,7 @@ function createServer(env: Env, ui: string) {
       description: `Turn an HTTP API into an integration: one tool per operation for OpenAPI 3 and Google Discovery documents, or query and schema tools for a GraphQL endpoint. If the API needs a credential, say how it is sent with auth; the user then sets the API_TOKEN secret for it at ${ui}. Every user shares that one credential.`,
       inputSchema: { name: z.string(), ...sourceInput },
     },
-    (input) => run(() => ops.newSource(env, input)),
+    (input) => added(() => ops.newSource(env, input)),
   );
   server.registerTool(
     "update_api_source",
@@ -112,7 +122,7 @@ function createServer(env: Env, ui: string) {
   server.registerTool(
     "add_skills",
     { description: "Publish a pack of skills (written instructions for agents) as a new integration. Agents read them through its skills tool.", inputSchema: { name: z.string(), skills } },
-    (input) => run(() => ops.newSkills(env, input)),
+    (input) => added(() => ops.newSkills(env, input)),
   );
   server.registerTool(
     "update_skills",

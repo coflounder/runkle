@@ -451,3 +451,95 @@ test("an agent regenerates an API source in place, held for review when it has s
   assert.ok(live().includes("createPet"));
   assert.equal(fake.scripts.get("runkle-app-pets")!.secrets.API_KEY, "k");
 });
+
+test("generated tools say what they do and whether they are safe to call", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => {
+    const request = new Request(input, init);
+    return new URL(request.url).host === "api.example.com" ? Response.json({ id: 7, env: "SECRET=1" }) : fake.handle(request);
+  });
+  const spec = JSON.stringify({
+    openapi: "3.0.0",
+    servers: [{ url: "https://api.example.com" }],
+    paths: {
+      "/compose.one": { get: { operationId: "compose-one", summary: "  ", description: "Get one compose" } },
+      "/compose.redeploy": { post: { operationId: "compose-redeploy", parameters: [{ name: "composeId", in: "query", schema: { type: "string" } }] } },
+      "/compose.replace": { put: { operationId: "compose-replace", summary: "x".repeat(400) } },
+      "/compose.remove": { delete: { operationId: "compose-remove" } },
+    },
+  });
+  await call("POST", "/api/sources", { name: "Dokploy", kind: "openapi", spec, auth: "none", redact: ["env"] });
+  const tools = Object.fromEntries((await rpc(fake, "runkle-app-dokploy", "tools/list")).tools.map((x: any) => [x.name, x]));
+  assert.equal(tools["compose-one"].description, "Get one compose", "a blank summary falls back to the description");
+  assert.equal(tools["compose-redeploy"].description, "POST /compose.redeploy", "an undocumented operation names its method and path");
+  assert.equal(tools["compose-replace"].description.length, 300);
+  assert.equal(tools["compose-remove"].description, "DELETE /compose.remove");
+  assert.deepEqual(tools["compose-one"].annotations, { readOnlyHint: true, idempotentHint: true });
+  assert.deepEqual(tools["compose-redeploy"].annotations, { readOnlyHint: false }, "a POST may delete in an RPC-style API, so it claims nothing more");
+  assert.deepEqual(tools["compose-replace"].annotations, { readOnlyHint: false, idempotentHint: true });
+  assert.deepEqual(tools["compose-remove"].annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: true });
+
+  // A JSON response comes back structured as well as text, redacted in both.
+  const result = await rpc(fake, "runkle-app-dokploy", "tools/call", { name: "compose-one", arguments: {} });
+  assert.deepEqual(result.structuredContent, { id: 7, env: "[redacted]" });
+  assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+
+  // A misspelt argument is refused, not silently dropped from the request.
+  const wrong = await rpc(fake, "runkle-app-dokploy", "tools/call", { name: "compose-redeploy", arguments: { composeid: "c1" } });
+  assert.equal(wrong.isError, true);
+  assert.equal(wrong.content[0].text, "Unknown argument: composeid. compose-redeploy takes composeId.");
+
+  await call("POST", "/api/sources", { name: "Graph", kind: "graphql", url: "https://api.example.com/graphql", auth: "none" });
+  const graph = (await rpc(fake, "runkle-app-graph", "tools/list")).tools;
+  assert.deepEqual(graph.map((x: any) => x.annotations), [undefined, { readOnlyHint: true }], "a query may be a mutation; the schema is only read");
+});
+
+test("a script's tools declare annotations and output, return structured results and refuse unknown arguments", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  const source = `export const tools = {
+  stats: {
+    input: { type: "object", properties: { days: { type: "number" } } },
+    output: { type: "object", properties: { days: { type: "number" } } },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    run: ({ days }) => ({ days }),
+  },
+  list: { run: (input) => [input] },
+  note: { run: () => "plain text" },
+  open: { input: { type: "object", properties: {}, additionalProperties: true }, run: (input) => input },
+};`;
+  await call("POST", "/api/apps", { name: "Stats", source });
+  const [stats, list] = (await rpc(fake, "runkle-app-stats", "tools/list")).tools;
+  assert.deepEqual(stats.annotations, { readOnlyHint: true, openWorldHint: false });
+  assert.deepEqual(stats.outputSchema, { type: "object", properties: { days: { type: "number" } } });
+  assert.equal(list.annotations, undefined);
+  assert.equal(list.outputSchema, undefined);
+
+  const result = (name: string, args?: unknown) => rpc(fake, "runkle-app-stats", "tools/call", { name, arguments: args });
+  assert.deepEqual((await result("stats", { days: 3 })).structuredContent, { days: 3 });
+  const array = await result("list", { a: 1 });
+  assert.equal(array.structuredContent, undefined, "structuredContent is an object; an array stays text");
+  assert.equal(array.content[0].text, '[{"a":1}]', "a tool that lists no properties takes any arguments");
+  assert.equal((await result("note")).structuredContent, undefined);
+
+  const refused = await result("stats", { days: 3, weeks: 1, months: 2 });
+  assert.equal(refused.isError, true);
+  assert.equal(refused.content[0].text, "Unknown arguments: weeks, months. stats takes days.");
+  assert.deepEqual((await result("open", { anything: 1 })).structuredContent, { anything: 1 }, "additionalProperties: true allows any name");
+});
+
+test("runkle's own MCP server tells agents how to use the portal and what an added integration needs", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  const mcp = async (method: string, params: unknown) => {
+    const response = await call("POST", "/mcp", { jsonrpc: "2.0", id: 1, method, params }, { "Content-Type": "application/json", Accept: "application/json, text/event-stream" });
+    return JSON.parse((await response.text()).match(/^data: (.*)$/m)![1]).result;
+  };
+  const init = await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } });
+  assert.match(init.instructions, /Using this portal: .*structuredContent.*same id.*queued.*prefer this portal/);
+
+  const added = await mcp("tools/call", { name: "add_skills", arguments: { name: "Playbooks", skills: [{ name: "triage", description: "When triaging", content: "# Steps" }] } });
+  const out = JSON.parse(added.content[0].text);
+  assert.equal(out.id, "playbooks");
+  assert.match(out.next_steps, /reconnects this portal's connector.*fresh session.*update_api_source or update_script/);
+});

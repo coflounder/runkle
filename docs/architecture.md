@@ -53,6 +53,21 @@ script's Worker and as the portal's credential for it, and kept nowhere else.
 The entry module is hand-written rather than the MCP SDK because an uploaded
 script has no bundler. runkle's own `/mcp` does use the SDK.
 
+What the entry module adds to a script's tools, so agents searching hundreds
+of them can tell them apart and call them safely:
+
+- `tools/list` carries a tool's `annotations` and its `output` schema (as
+  `outputSchema`) when the module declares them. Generated API tools get
+  annotations from the HTTP method and a description that is never empty.
+- A plain object returned by `run` is sent as `structuredContent` beside the
+  text. The generated HTTP client returns JSON responses parsed for this.
+- Arguments the input schema's `properties` does not name are refused with
+  an error naming the allowed ones, unless the schema sets
+  `additionalProperties: true`. A schema with no `properties` takes anything.
+
+An existing app only gets a new entry module when it is uploaded again
+(`update_script`, `update_api_source`).
+
 ## Apps: everything that is not an MCP server
 
 The portal only aggregates MCP servers, so anything else becomes one: an "app",
