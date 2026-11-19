@@ -47,7 +47,7 @@ function createServer(env: Env, ui: string) {
   const server = new McpServer(
     { name: "runkle", version: "1.0.0" },
     {
-      instructions: `Manage the integrations served by this runkle portal. Never ask the user for a password, token or API key and never put one in a script: declare what the script reads from \`env\`, then give the user the link from request_credentials so they can enter the values themselves. For an MCP server that needs an access token or its own OAuth client, give them the link from request_mcp_server_setup.\n\n${USING_THE_PORTAL}\n\n${SCRIPT_FORMAT}`,
+      instructions: `Manage the integrations served by this runkle portal. Never ask the user for a password, token or API key and never put one in a script: declare what the script reads from \`env\`, then use generate_secret when the value is one you could make up (a shared token, a signing key), or give the user the link from request_credentials so they can enter values only they have. For an MCP server that needs an access token or its own OAuth client, give them the link from request_mcp_server_setup.\n\n${USING_THE_PORTAL}\n\n${SCRIPT_FORMAT}`,
     },
   );
 
@@ -171,6 +171,25 @@ function createServer(env: Env, ui: string) {
       annotations: { readOnlyHint: true },
     },
     (input) => run(() => ops.credentialLink(env, ui, input)),
+  );
+  server.registerTool(
+    "generate_secret",
+    {
+      description:
+        "Make a new random credential and set it where it is used, without anyone seeing or pasting it: as secrets on scripts or HTTP APIs, and/or as the bearer token the portal sends to a remote MCP server. Optionally keep a copy in 1Password through a 1Password integration (scripts/onepassword.js), so the user can give the same value to the other side. The value is never returned. The first call waits until the user approves in their runkle inbox and returns a link; call again with exactly the same arguments to run it, once.",
+      inputSchema: {
+        targets: z
+          .array(z.union([z.object({ app: id, secret: z.string().describe("Secret name, UPPER_SNAKE_CASE") }), z.object({ server: id.describe("A remote MCP server that signs in with a bearer token") })]))
+          .describe("Where the same value goes, 1 to 10 places"),
+        length: z.number().int().optional().describe("16 to 128 characters, default 40"),
+        alphabet: z.enum(["alphanumeric", "hex", "base64url"]).optional().describe("Default alphanumeric"),
+        copy_to: z
+          .object({ app: id.describe("The integration that keeps copies, e.g. 1Password"), vault: z.string(), item: z.string().describe("Item title; created if missing"), field: z.string().describe("Field label; replaced if present, the old value stays in the item's history") })
+          .optional(),
+      },
+      annotations: { destructiveHint: true },
+    },
+    (input) => run(() => ops.generateSecret(env, ui, input)),
   );
   server.registerTool(
     "request_mcp_server_setup",

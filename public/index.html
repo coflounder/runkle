@@ -177,7 +177,15 @@
     <h2 id="h-app">Update script</h2>
     <label>Replace script <input type="file" name="file" accept=".js,.mjs,text/javascript"></label>
     <small>Leave empty to keep the current script. Existing secrets and stored data are kept unless you set a secret again below. An HTTP API's credential is the secret <code>API_TOKEN</code>. A new value replaces its secret's expiry date with the one beside it, or none.</small>
+    <small id="app-secrets"></small>
     <div class="stack" data-secrets></div>
+    <fieldset id="keep" class="stack" hidden>
+      <legend>Keep generated values in 1Password</legend>
+      <label>Through <select name="keep_app"></select></label>
+      <label>Vault <input type="text" name="keep_vault" autocomplete="off"></label>
+      <label>Item <input type="text" name="keep_item" autocomplete="off"></label>
+      <small>Generated values are made by runkle and set without anyone seeing them. With a copy, each goes in a field named after its secret, in this item (created if missing), so you can give the same value to the other side. If you later type a value for that secret yourself, it is no longer marked as having a copy.</small>
+    </fieldset>
     <label>Ask me first <textarea name="ask_first" rows="3" spellcheck="false" autocapitalize="off"></textarea></label>
     <small>Tool names, one per line; <code>*</code> matches anything, so <code>delete_*</code> covers every delete. An agent's call to one of these waits until you approve it in your inbox. Agents cannot change this list.</small>
     <p id="app-error" class="error" role="alert" hidden></p>

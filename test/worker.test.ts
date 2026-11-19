@@ -218,7 +218,7 @@ test("an app's storage, skills, schedules, webhooks, pages and workflows", async
   assert.deepEqual(script().schedules, [{ cron: "0 6 * * *" }]);
   assert.deepEqual(fake.workflows.get("runkle-app-rich"), { class_name: "Flow", script_name: "runkle-app-rich" });
   const [open, gate] = [...fake.apps.values()].filter((a) => a.type === "self_hosted");
-  assert.deepEqual(open.destinations.map((d: any) => d.uri), ["mcp", "webhooks", "manifest"].map((area) => `runkle-app-rich.acme.workers.dev/${area}`));
+  assert.deepEqual(open.destinations.map((d: any) => d.uri), ["mcp", "webhooks", "manifest", "vault"].map((area) => `runkle-app-rich.acme.workers.dev/${area}`));
   assert.equal(open.policies[0].decision, "bypass");
   assert.equal(gate.domain, "runkle-app-rich.acme.workers.dev");
   assert.deepEqual(gate.policies, [{ id: "pol-1", precedence: 1 }], "pages get the portal's Access policies");
@@ -877,4 +877,208 @@ test("dates are entered beside values and agents can record them, never a value"
   assert.match(expired.problems[0].reason, /SHOT_TOKEN expired on/);
   await mcp("set_secret_expiry", { id: "shots", name: "SHOT_TOKEN", expires: null });
   assert.equal(((await (await call("GET", "/api/state")).json()) as any).integrations[0].secret_expiry, undefined);
+});
+
+// A 1Password Connect server at op.example.com, in memory, with the "Agents" vault. Everything else goes to the fake Cloudflare.
+function connect(t: any, fake: ReturnType<typeof fakeCloudflare>) {
+  const vault = { id: "v".repeat(26), name: "Agents", items: 1 };
+  const items = new Map<string, any>([
+    ["i".repeat(26), {
+      id: "i".repeat(26), title: "Discogs", category: "LOGIN", tags: ["music"], urls: [{ href: "https://discogs.com" }], updatedAt: "2025-01-01T00:00:00Z",
+      fields: [
+        { id: "username", label: "username", type: "STRING", purpose: "USERNAME", value: "jay" },
+        { id: "password", label: "password", type: "CONCEALED", purpose: "PASSWORD", value: "old-pw" },
+      ],
+    }],
+  ]);
+  const writes: any[] = [], seen: string[] = [];
+  let made = 0;
+  t.mock.method(globalThis, "fetch", async (input: any, init: any) => {
+    const request = new Request(input, init), url = new URL(request.url);
+    if (url.hostname !== "op.example.com") return fake.handle(request);
+    assert.equal(request.headers.get("Authorization"), "Bearer connect-token");
+    const text = request.body ? await request.text() : "";
+    seen.push(text);
+    const body: any = text ? JSON.parse(text) : undefined;
+    // What Connect does with generate: makes the value itself.
+    const stored = (i: any) => ({ ...i, fields: i.fields.map(({ generate, recipe, ...f }: any) => (generate ? { ...f, id: f.id ?? "f" + ++made, value: `generated-${recipe.length}-${++made}` } : { ...f, id: f.id ?? "f" + ++made })) });
+    const at = `${request.method} ${url.pathname}`, filter = url.searchParams.get("filter");
+    const itemPath = new RegExp(`^/v1/vaults/${vault.id}/items/([a-z0-9]+)$`);
+    if (at === "GET /v1/vaults") return Response.json(filter && filter !== 'name eq "Agents"' ? [] : [vault]);
+    if (at === `GET /v1/vaults/${vault.id}/items`)
+      return Response.json([...items.values()].filter((i) => !filter || filter === `title eq "${i.title}"`).map(({ fields, ...summary }) => summary));
+    const [, itemId] = url.pathname.match(itemPath) ?? [];
+    if (request.method === "GET" && itemId) return Response.json(items.get(itemId));
+    if (request.method === "PUT" && itemId) return writes.push(body), items.set(itemId, stored(body)), Response.json(items.get(itemId));
+    if (at === `POST /v1/vaults/${vault.id}/items`) {
+      // A Connect error that quotes what it was sent, as some do.
+      if (body.title === "Rejected") return Response.json({ message: `invalid item: ${JSON.stringify(body.fields)}` }, { status: 400 });
+      const item = { ...stored(body), id: String(++made).padStart(26, "n") };
+      return writes.push(body), items.set(item.id, item), Response.json(item);
+    }
+    return Response.json({ message: "not found" }, { status: 404 });
+  });
+  const secrets = { OP_CONNECT_HOST: "https://op.example.com/", OP_CONNECT_TOKEN: "connect-token" };
+  const byTitle = (title: string) => [...items.values()].find((i) => i.title === title);
+  return { items, writes, seen, secrets, byTitle };
+}
+
+test("1Password: metadata is free, values and writes ask first, and no tool takes a secret", async (t) => {
+  const fake = fakeCloudflare();
+  const op = connect(t, fake);
+  const item = op.byTitle("Discogs");
+  const { made: app, tool, approved } = await readyMade(fake, "onepassword.js", "1Password", op.secrets);
+  assert.deepEqual(app.approvals, ["read_secret", "create_item", "generate_field", "copy_field"]);
+  assert.ok(!app.tools.includes("vault"), "keeping a copy is not a tool: no agent can hand it a value");
+  const discogs = { vault: "Agents", item: "Discogs" };
+  const values = /old-pw|generated-/;
+
+  // Free: where things are and what they are called, never what they hold.
+  const free = [await tool("list_vaults"), await tool("list_items", { vault: "Agents", search: "disc" }), await tool("get_item", discogs)];
+  assert.ok(!values.test(JSON.stringify(free)));
+  assert.deepEqual(free[2].fields.map((f: any) => [f.label, f.value, f.filled]), [["username", "jay", true], ["password", undefined, true]]);
+  assert.match((await tool("get_item", { vault: "Personal", item: "Bank" })).error, /No vault called "Personal"/, "only the vaults the token covers");
+
+  // Rotation without anyone seeing a value: generate into a spare field, then copy it over the live one.
+  const staged = await approved("generate_field", { ...discogs, field: "staged password", symbols: false }, /Set "staged password" of item "Discogs" in vault "Agents" with a newly generated value/);
+  assert.ok(!values.test(JSON.stringify(staged)));
+  assert.deepEqual(op.writes[0].fields[2], { type: "CONCEALED", label: "staged password", generate: true, recipe: { length: 32, characterSets: ["LETTERS", "DIGITS"] } });
+  await approved("copy_field", { ...discogs, from: "staged password", to: "password" }, /Copy "staged password" over "password".*history/s);
+  const now = op.byTitle("Discogs");
+  assert.match(now.fields[1].value, /^generated-32-/);
+  assert.equal(now.fields[1].value, now.fields[2].value);
+  assert.match((await tool("copy_field", { ...discogs, from: "nope", to: "password" })).error, /No field called "nope"/);
+
+  // Reading a value into the conversation is possible, and always asked.
+  assert.equal(await approved("read_secret", { ...discogs, field: "password" }, /Show the agent the value of "password" from item "Discogs".*conversation/s), now.fields[1].value);
+
+  const created = await approved("create_item", { vault: "Agents", title: "New API", username: "bot", generate_password: true, length: 20 }, /Create the item "New API" in vault "Agents" with a generated password/);
+  assert.ok(created.id && !values.test(JSON.stringify(created)));
+  assert.equal(op.writes.length, 3, "each write ran once, after approval");
+  void item;
+});
+
+test("generate_secret: asked first, set once, kept in 1Password, and never seen", async (t) => {
+  const fake = fakeCloudflare();
+  const op = connect(t, fake);
+  const logged: string[] = [];
+  for (const level of ["log", "info", "warn", "error", "debug"] as const) t.mock.method(console, level, (...args: unknown[]) => void logged.push(args.map(String).join(" ")));
+  const { generateSecret } = await import("../src/ops.ts");
+  const said: string[] = []; // everything runkle answered, to search for the value
+  const answer = async (response: Response) => (said.push(await response.clone().text()), response.json() as Promise<any>);
+
+  await call("POST", "/api/apps", { name: "Hooks", source: SCRIPT, secrets: { KEY: "k" } });
+  await call("POST", "/api/apps", { name: "New", source: SCRIPT });
+  await readyMade(fake, "onepassword.js", "1Password", op.secrets);
+  await call("POST", "/api/integrations", { name: "Upstream", url: "https://upstream.example/mcp", auth: "bearer", token: "old-token" });
+  await call("POST", "/api/integrations", { name: "Docs", url: "https://docs.example/mcp", auth: "none" });
+
+  // Through runkle's own MCP endpoint, as an agent calls it.
+  const mcp = async (args: unknown) => {
+    const response = await call("POST", "/mcp", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "generate_secret", arguments: args } }, { "Content-Type": "application/json", Accept: "application/json, text/event-stream" });
+    const text = await response.text();
+    said.push(text);
+    const result = JSON.parse(text.match(/^data: (.*)$/m)![1]).result;
+    return result.isError ? { error: result.content[0].text } : JSON.parse(result.content[0].text);
+  };
+  const request = {
+    targets: [{ app: "hooks", secret: "WEBHOOK_SECRET" }, { server: "upstream" }],
+    length: 48,
+    copy_to: { app: "1password", vault: "Agents", item: "Upstream webhook", field: "token" },
+  };
+  const hooks = () => fake.scripts.get("runkle-app-hooks")!.secrets;
+  const nothingSet = () => {
+    assert.equal(hooks().WEBHOOK_SECRET, undefined);
+    assert.equal(fake.credentials.get("upstream"), "old-token");
+    assert.equal(op.byTitle("Upstream webhook"), undefined);
+  };
+
+  // The rules are checked before anyone is asked.
+  assert.match((await mcp({ targets: [{ app: "hooks", secret: "RUNKLE_TOKEN" }] })).error, /reserved/);
+  assert.match((await mcp({ targets: [{ app: "docs", secret: "X" }] })).error, /No script/);
+  assert.match((await mcp({ targets: [{ server: "hooks" }] })).error, /runkle's to manage/);
+  assert.match((await mcp({ targets: [{ server: "docs" }] })).error, /bearer/);
+  assert.match((await mcp({ targets: [{ app: "hooks", secret: "A" }], length: 8 })).error, /16 to 128/);
+  assert.match((await mcp({ ...request, copy_to: { ...request.copy_to, app: "new" } })).error, /holds no secrets/, "a vault app's code must be reviewed code");
+  assert.deepEqual(((await answer(await call("GET", "/api/inbox"))) as any).waiting, []);
+
+  const asked = await mcp(request);
+  assert.match(asked.waiting_for_approval, /^https:\/\/runkle\.test\/#inbox=[0-9a-f]{32}$/);
+  assert.match(asked.next, /same arguments/);
+  nothingSet();
+  assert.equal((await mcp({ copy_to: request.copy_to, length: 48, targets: request.targets })).waiting_for_approval, asked.waiting_for_approval, "asking again, in any key order, finds the same request");
+  nothingSet();
+
+  // The person sees where it goes and where the copy is kept: names, never a value (there is none yet).
+  const id = new URLSearchParams(new URL(asked.waiting_for_approval).hash.slice(1)).get("inbox")!;
+  const [item] = (await answer(await call("GET", "/api/inbox"))).waiting;
+  assert.deepEqual([item.id, item.kind, item.app, item.tool], [id, "approval", "runkle", "generate_secret"]);
+  assert.deepEqual(item.input, { targets: request.targets, length: 48, alphabet: "alphanumeric", copy_to: request.copy_to });
+  assert.equal(
+    item.title,
+    'Generate a 48-character alphanumeric secret and set it as WEBHOOK_SECRET on hooks and as the bearer token the portal sends to upstream. Keep a copy in vault "Agents", item "Upstream webhook", field "token" (through 1password). Nobody sees the value.',
+  );
+  assert.equal((await call("POST", `/api/inbox/${id}`, { approve: true })).status, 200);
+
+  const done = await mcp(request);
+  assert.deepEqual(done.set, ["WEBHOOK_SECRET on hooks", "bearer token of upstream"]);
+  assert.deepEqual(done.copy, { vault: "Agents", item: "Upstream webhook", field: "token" });
+  const value = hooks().WEBHOOK_SECRET;
+  assert.match(value, /^[A-Za-z0-9]{48}$/);
+  assert.equal(fake.credentials.get("upstream"), value, "the portal sends the same value upstream");
+  assert.equal(fake.servers.get("upstream").name, "Upstream");
+  const kept = op.byTitle("Upstream webhook");
+  assert.deepEqual([kept.category, kept.tags, kept.fields.map((f: any) => [f.label, f.type, f.value])], ["LOGIN", ["runkle"], [["token", "CONCEALED", value]]]);
+  assert.match((await mcp(request)).waiting_for_approval, /#inbox=/, "an approval runs once");
+
+  // Which secrets have a copy, by name only.
+  const listed = (await answer(await call("GET", "/api/state"))).integrations.find((i: any) => i.id === "hooks");
+  assert.deepEqual([listed.secrets_set, listed.secrets_copied], [["KEY", "WEBHOOK_SECRET"], ["WEBHOOK_SECRET"]]);
+  assert.equal(await (await fake.app("runkle-app-hooks")).env.RUNKLE_COPY_WEBHOOK_SECRET, "1");
+  const ran = JSON.parse((await callTool(fake, "runkle-app-hooks", "whoami")).text);
+  assert.equal(ran.sawPortalToken, false, "the mark is runkle's and never reaches the script");
+
+  // Generating again into the same item replaces the field; the old value stays in 1Password's history.
+  const again = { targets: [{ app: "hooks", secret: "WEBHOOK_SECRET" }], alphabet: "hex", copy_to: request.copy_to };
+  const second = await generateSecret(env, origin, again, "dev@localhost"); // from runkle's own UI: the person is the approval
+  said.push(JSON.stringify(second));
+  assert.match(hooks().WEBHOOK_SECRET, /^[0-9a-f]{40}$/);
+  assert.deepEqual(op.byTitle("Upstream webhook").fields.map((f: any) => f.value), [hooks().WEBHOOK_SECRET]);
+  const values = [value, hooks().WEBHOOK_SECRET];
+
+  // A value typed by hand has no copy anywhere: the mark goes.
+  await call("PUT", "/api/apps/hooks", { secrets: { WEBHOOK_SECRET: "typed" } });
+  assert.deepEqual((await answer(await call("GET", "/api/state"))).integrations.find((i: any) => i.id === "hooks").secrets_copied, []);
+
+  // The UI route needs a person's request from runkle's own page.
+  assert.equal((await call("POST", "/api/generate", { targets: [{ app: "hooks", secret: "OTHER" }] }, {})).status, 403);
+  const fromUi = await answer(await call("POST", "/api/generate", { targets: [{ app: "new", secret: "SIGNING_KEY" }], alphabet: "base64url", length: 64 }));
+  assert.deepEqual(fromUi.set, ["SIGNING_KEY on new"]);
+  values.push(fake.scripts.get("runkle-app-new")!.secrets.SIGNING_KEY);
+  assert.match(values[2], /^[A-Za-z0-9_-]{64}$/);
+
+  // A failed copy sets nothing, and its error never carries the value.
+  const rejected = { targets: [{ app: "hooks", secret: "LATER" }], copy_to: { ...request.copy_to, item: "Rejected" } };
+  await assert.rejects(generateSecret(env, origin, rejected, "dev@localhost"), (error: Error) => {
+    said.push(error.message);
+    assert.match(error.message, /Keeping a copy failed: 1Password: invalid item: .*\[the generated value\]/);
+    return true;
+  });
+  assert.equal(hooks().LATER, undefined);
+  values.push(JSON.parse(op.seen.filter((s) => s.includes("Rejected")).at(-1)!).fields[0].value);
+  await assert.rejects(generateSecret(env, origin, { targets: [{ app: "hooks", secret: "LATER" }], copy_to: { ...request.copy_to, app: "hooks" } }, "dev@localhost"), /hooks cannot keep copies: its script exports no vault/);
+  assert.equal(hooks().LATER, undefined);
+
+  // An agent sees none of it: not in any answer, the inbox, a log, or the vault app's tools and storage.
+  const tools = await Promise.all([callTool(fake, "runkle-app-1password", "list_items", { vault: "Agents" }), callTool(fake, "runkle-app-1password", "get_item", { vault: "Agents", item: "Upstream webhook" })]);
+  said.push(JSON.stringify(tools), await (await call("GET", "/api/state")).text(), await (await call("GET", "/api/inbox")).text());
+  const everywhere = [...said, JSON.stringify([...fake.inboxData]), ...logged, JSON.stringify([...fake.scripts.get("runkle-app-1password")!.data])].join("\n");
+  for (const v of values) assert.ok(v && !everywhere.includes(v), "the generated value never leaves where it was put");
+
+  // Denied is final.
+  const denied = { targets: [{ app: "hooks", secret: "NOPE" }] };
+  const deniedId = new URLSearchParams(new URL((await mcp(denied)).waiting_for_approval).hash.slice(1)).get("inbox")!;
+  await call("POST", `/api/inbox/${deniedId}`, { approve: false });
+  assert.match((await mcp(denied)).error, /Denied by dev@localhost/);
+  assert.equal(hooks().NOPE, undefined);
 });

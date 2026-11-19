@@ -40,17 +40,30 @@ async function act(control, fn) {
 
 // ---- Secret fields: write-only, masked, wiped whenever their dialog closes ----
 
-function secretFields(container) {
+// With `onGenerate`, each row can instead have runkle generate its value, which
+// nobody types or sees; `onGenerate` is told whether any row does.
+function secretFields(container, onGenerate) {
   const rows = h("div", { className: "stack" });
   const add = h("button", { type: "button", textContent: "Add a secret" });
+  const generating = () => [...rows.children].filter((r) => r.querySelector("[data-generate]")?.checked);
   const addRow = (name = "") => {
     const remove = h("button", { type: "button", textContent: "Remove", ariaLabel: "Remove this secret" });
-    const row = h("div", { className: "secret" },
+    const value = h("input", { type: "password", placeholder: "value", ariaLabel: "Secret value", required: true, autocomplete: "new-password" });
+    const generate = onGenerate && h("input", { type: "checkbox", title: "runkle makes a random value; nobody sees it" });
+    if (generate) {
+      generate.dataset.generate = "";
+      generate.onchange = () => {
+        Object.assign(value, { disabled: generate.checked, value: "", placeholder: generate.checked ? "runkle makes it" : "value" });
+        onGenerate(generating().length > 0);
+      };
+    }
+    const row = h("div", { className: generate ? "secret generate" : "secret" },
       h("input", { type: "text", placeholder: "NAME", ariaLabel: "Secret name", pattern: "[A-Z][A-Z0-9_]*", required: true, autocomplete: "off", spellcheck: false }),
-      h("input", { type: "password", placeholder: "value", ariaLabel: "Secret value", required: true, autocomplete: "new-password" }),
+      value,
       h("input", { type: "date", ariaLabel: "Expires on (optional)", title: "Expires on (optional): runkle warns you 14 days before" }),
+      generate ? h("label", { className: "check" }, generate, "Generate") : null,
       remove);
-    remove.onclick = () => row.remove();
+    remove.onclick = () => { row.remove(); onGenerate?.(generating().length > 0); };
     rows.append(row);
     row.children[0].value = name;
     row.children[name ? 1 : 0].focus();
@@ -58,9 +71,10 @@ function secretFields(container) {
   add.onclick = () => addRow();
   container.append(rows, h("div", {}, add));
   return {
-    values: () => Object.fromEntries([...rows.children].map((r) => [r.children[0].value, r.children[1].value])),
-    expires: () => Object.fromEntries([...rows.children].filter((r) => r.children[2].value).map((r) => [r.children[0].value, r.children[2].value])),
-    clear: () => rows.replaceChildren(),
+    values: () => Object.fromEntries([...rows.children].filter((r) => !generating().includes(r)).map((r) => [r.children[0].value, r.children[1].value])),
+    expires: () => Object.fromEntries([...rows.children].filter((r) => !generating().includes(r) && r.children[2].value).map((r) => [r.children[0].value, r.children[2].value])),
+    generated: () => generating().map((r) => r.children[0].value),
+    clear: () => { rows.replaceChildren(); onGenerate?.(false); },
     add: addRow,
   };
 }
@@ -227,7 +241,7 @@ function integrationRow(i, open) {
     i.error ? h("p", { className: "error tools" }, i.error) : null,
     ...(checked?.problems ?? []).map((p) => h("p", { className: "tools wrap" }, h("strong", {}, p.reason), " ", h("small", {}, p.fix))),
     checked?.note ? h("p", { className: "muted tools" }, checked.note) : null,
-    i.secrets_set?.length ? h("p", { className: "muted tools" }, `Secrets set: ${i.secrets_set.map(expiry).join(", ")}`) : null,
+    i.secrets_set?.length ? h("p", { className: "muted tools" }, `Secrets set: ${i.secrets_set.map(expiry).join(", ")}`, i.secrets_copied?.length ? `. Copy in 1Password: ${i.secrets_copied.join(", ")}` : "") : null,
     i.ask_first?.length ? h("p", { className: "muted tools" }, `Asks you first: ${i.ask_first.join(", ")}. Requests wait in the inbox.`) : null,
     h("div", { className: "tools" }, ...tools),
     h("div", { className: "actions" }, review, sync, edit,
@@ -335,24 +349,33 @@ form.onsubmit = async (e) => {
 // ---- Update an uploaded script ----
 
 const appForm = $("app-form");
-const appSecrets = secretFields(appForm.querySelector("[data-secrets]"));
+const appSecrets = secretFields(appForm.querySelector("[data-secrets]"), (any) => ($("keep").hidden = !any));
 function openApp(i) {
   appForm.dataset.id = i.id;
   appForm.ask_first.value = appForm.dataset.ask = (i.ask_first || []).join("\n");
   $("h-app").textContent = `Update ${i.name}`;
+  $("app-secrets").textContent = i.secrets_set?.length
+    ? `Set: ${i.secrets_set.join(", ")}.${i.secrets_copied?.length ? ` Copy in 1Password: ${i.secrets_copied.join(", ")}.` : ""}`
+    : "No secrets set yet.";
+  // Apps that can be handed a copy hold secrets of their own, so their code is reviewed.
+  const vaults = state.integrations.filter((x) => x.is_app && x.secrets_set?.length);
+  appForm.keep_app.replaceChildren(h("option", { value: "", textContent: "Don't keep a copy" }), ...vaults.map((x) => h("option", { value: x.id, textContent: x.name })));
+  appForm.keep_app.value = vaults.find((x) => /1-?password|onepassword/.test(x.id))?.id ?? "";
   $("app-dialog").showModal();
 }
 const closeApp = secretDialog($("app-dialog"), appForm, $("app-error"), appSecrets);
 appForm.onsubmit = (e) =>
   submit(e, $("app-error"), closeApp, async () => {
+    const id = appForm.dataset.id;
     const file = appForm.file.files[0];
     const ask = appForm.ask_first.value.trim();
-    return api("PUT", `/api/apps/${appForm.dataset.id}`, {
-      ...(file && { source: await file.text() }),
-      secrets: appSecrets.values(),
-      expires: appSecrets.expires(),
-      ...(ask !== appForm.dataset.ask && { ask_first: ask ? ask.split(/\s+/) : [] }),
-    });
+    const typed = appSecrets.values(), generated = appSecrets.generated();
+    const change = { ...(file && { source: await file.text() }), ...(ask !== appForm.dataset.ask && { ask_first: ask ? ask.split(/\s+/) : [] }) };
+    const made = Object.keys(change).length || Object.keys(typed).length || !generated.length ? await api("PUT", `/api/apps/${id}`, { ...change, secrets: typed, expires: appSecrets.expires() }) : undefined;
+    // One value per name, each in a field of that name.
+    const keep = appForm.keep_app.value && { app: appForm.keep_app.value, vault: appForm.keep_vault.value, item: appForm.keep_item.value };
+    for (const name of generated) await api("POST", "/api/generate", { targets: [{ app: id, secret: name }], ...(keep && { copy_to: { ...keep, field: name } }) });
+    return made;
   }).then((made) => made?.id && showDeployed(made));
 
 // ---- Review a change an agent proposed to a script that holds secrets ----

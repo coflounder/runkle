@@ -41,6 +41,8 @@ function route(request: Request, env: Env, me: string): (() => Promise<unknown>)
   if (key === "PUT /api/agent-auth") return async () => ops.setAgentAuth(env, await body());
   if (key === "PUT /api/portal") return async () => ops.setCodeMode(env, await body());
   if (id && key === `PUT /api/apps/${id}`) return async () => ops.changeApp(env, ui, id, await body());
+  // A person generating a secret from the UI is the approval; an agent's generate_secret waits in the inbox.
+  if (key === "POST /api/generate") return async () => ops.generateSecret(env, ui, await body(), me);
   // Deciding on an agent's proposed change is for people only: there is no MCP tool for it.
   if (id && key === `GET /api/apps/${id}/proposal`) return () => ops.reviewChange(env, id);
   if (id && key === `POST /api/apps/${id}/proposal`) return async () => ops.decideChange(env, ui, id, await body(), me);

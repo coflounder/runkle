@@ -40,7 +40,8 @@ Cloudflare only.
 | POST `/api/sources` | generate an app from an OpenAPI or Discovery document or a GraphQL endpoint, then as POST `/api/apps` | (fetches the document), then as above |
 | POST `/api/skills` | generate an app that only carries skills, then as POST `/api/apps` | as above |
 | GET, POST `/api/health` | the last health report; run the check now and update its inbox alerts | GET portal, GET access apps, per app GET worker settings, versions, deployments and its source, then the app's `/manifest/probe` |
-| POST `/mcp` | the operations above as MCP tools, minus anything that carries a secret | as above |
+| POST `/api/generate` | generate a secret and set it on apps and/or a server's bearer token, keeping a copy if asked (a person's request: no inbox item) | PUT worker secrets, PUT server, then the vault app's `/vault` |
+| POST `/mcp` | the operations above as MCP tools, minus anything that carries a secret; `generate_secret` waits for approval in the inbox | as above |
 
 Token permissions: `MCP Portals Write`, `Access: Apps and Policies Write`,
 `Workers Scripts Write`.
@@ -103,6 +104,48 @@ returns secrets (Dokploy returns an app's env) never hands them to an agent.
 `update_api_source` regenerates a source in place, keeping its id, secrets and
 portal registration; like any agent change to a script with secrets, it waits
 for review.
+
+## Generated secrets
+
+`generate_secret` (`generateSecret` in `src/ops.ts`, the pure part in
+`src/generate.ts`) is the one MCP tool that changes a credential, so it asks
+first the same way an app's gated tool does: the normalized request (targets,
+length, alphabet, where to keep a copy) is an `approval` item whose id is a
+SHA-256 of it, the agent gets a link, and its repeated call runs once after a
+person approves. Every rule is checked before the item is opened. The value
+does not exist until then: it is made in the call that runs, with
+`crypto.getRandomValues` and rejection sampling, and lives only in that call.
+
+| step | where it goes |
+| --- | --- |
+| 1. copy, if asked | the vault app's `/vault`, see below. First, so a value never goes live with no copy |
+| 2. targets | `PUT workers/scripts/runkle-app-<id>/secrets` per app secret; `PUT access/ai-controls/mcp/servers/<id>` with `auth_credentials` per remote bearer server |
+| 3. mark | `RUNKLE_COPY_<NAME>`, a secret binding on the app whose value says nothing. Its name is how `appConfig` reports `secrets_copied`. A value set by hand deletes it |
+
+Error text from any step has the value replaced before it is returned. A
+person generating from the UI (`POST /api/generate`) is their own approval.
+
+A copy goes to a runkle app that exports `vault` (`scripts/onepassword.js`,
+which writes to a 1Password Connect server), because the 1Password credential
+must live as an app's secret, not runkle's. runkle sets a fresh key as the
+app's `RUNKLE_SETUP` (the same secret it reads `/manifest` with), then POSTs
+the value to the app's `/vault` with it; the entry module checks the key and
+hands the value to `vault.save` as an argument. The app's env never holds it,
+no MCP tool reaches `vault`, and runkle keeps neither the key nor the value.
+Setting the key is a Worker deployment, so the call retries on 401 for a few
+seconds while it spreads. The vault app must hold secrets, so its code is
+reviewed code.
+
+Why Connect and not a service account: service accounts have no HTTP API
+(only the `op` CLI and the Go, JavaScript and Python SDKs), and the JavaScript
+SDK's WebAssembly core is loaded with `fs.readFileSync(__dirname + ...)`, which
+Workers cannot run (onepassword-sdk-js#184, open). Bundling a patched 14 MB
+core would also need a WebAssembly module in an app's upload, which apps do not take.
+
+Not covered: a target script that holds no secrets can be one an agent wrote,
+and its code can read the value; the approval says so. And a portal server's
+new token is only useful once the upstream server has the same value, which
+is what the copy is for.
 
 ## Credential links
 

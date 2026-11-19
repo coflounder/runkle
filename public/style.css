@@ -67,8 +67,11 @@ dialog .bar { justify-content: flex-end; }
 #banner { padding: 10px var(--gap); border: 1px solid var(--bad); color: var(--bad); border-radius: var(--radius); }
 [hidden] { display: none !important; }
 .stack { display: grid; gap: 14px; }
-.secret { display: grid; grid-template-columns: 1fr 1fr 9.5em auto; gap: 8px; }
-@media (max-width: 480px) { .secret { grid-template-columns: 1fr 1fr; } }
+.secret { display: grid; grid-template-columns: 1fr 1fr 9.5em auto; gap: 8px; align-items: center; }
+.secret.generate { grid-template-columns: 1fr 1fr 9.5em auto auto; }
+@media (max-width: 480px) { .secret, .secret.generate { grid-template-columns: 1fr 1fr; } }
+fieldset { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; margin: 0; }
+legend { font-weight: 500; padding: 0 4px; }
 .secret input { font-family: var(--mono); font-size: 13px; }
 input[type=file] { font: inherit; }
 .item { display: grid; gap: 8px; }
