@@ -100,6 +100,79 @@ test("add, toggle, and remove integrations without disturbing the others", async
   assert.equal(fake.apps.get("portal-app").policies.length, 1, "existing Access settings survive the update");
 });
 
+test("collections: runkle makes the portal, DNS and sign-in, fills it, scopes tools and takes it all down", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  const state = async () => (await (await call("GET", "/api/state")).json()) as any;
+  fake.apps.get("portal-app").oauth_configuration = { enabled: true, dynamic_client_registration: { enabled: true, allow_any_on_localhost: true } };
+  fake.apps.get("portal-app").session_duration = "24h";
+  for (const name of ["Notes", "Garmin", "Linear"]) await call("POST", "/api/integrations", { name, url: `https://${name.toLowerCase()}.example/mcp`, auth: "none" });
+  await call("PUT", "/api/integrations/garmin/tools", { tool: "delete_record", enabled: false });
+
+  const made = (await (await call("POST", "/api/collections", { name: "Personal", integrations: ["notes", "garmin"] })).json()) as any;
+  assert.equal(made.endpoint, "https://mcp-personal.example.com/mcp", "one label under the main portal's domain");
+  const portal = fake.portals.get("runkle-personal");
+  assert.deepEqual(portal.servers.map((m: any) => m.server_id), ["notes", "garmin"]);
+  assert.deepEqual(portal.servers[1].updated_tools, [{ name: "delete_record", enabled: false }], "joins with the main portal's tool settings");
+  assert.equal(portal.code_mode, "opt_in");
+  const record = [...fake.dns.values()].find((r) => r.name === "mcp-personal.example.com");
+  assert.deepEqual([record.type, record.content, record.proxied], ["CNAME", "portal.gateway.test", true], "points where the main portal does");
+  const gate = [...fake.apps.values()].find((a) => a.type === "mcp_portal" && a.domain === "mcp-personal.example.com");
+  assert.deepEqual(gate.policies, [{ id: "pol-1", precedence: 1 }]);
+  assert.equal(gate.oauth_configuration.dynamic_client_registration.allow_any_on_localhost, true, "agents sign in as they do to the main portal");
+  assert.equal(gate.session_duration, "24h");
+
+  let s = await state();
+  assert.deepEqual(s.collections, [
+    {
+      id: "personal",
+      name: "Personal",
+      endpoint: "https://mcp-personal.example.com/mcp",
+      code_mode: "opt_in",
+      integrations: [
+        { id: "notes", blocked_tools: [] },
+        { id: "garmin", blocked_tools: ["delete_record"] },
+      ],
+    },
+  ]);
+  assert.deepEqual(s.integrations.map((i: any) => i.collections), [["personal"], ["personal"], []]);
+
+  // Tools and code mode change in the collection alone.
+  await call("PUT", "/api/integrations/notes/tools", { tool: "search", enabled: false, collection: "personal" });
+  await call("PUT", "/api/portal", { code_mode: "enforced", collection: "personal" });
+  s = await state();
+  assert.deepEqual(s.collections[0].integrations[0].blocked_tools, ["search"]);
+  assert.equal(s.integrations[0].tools[0].enabled, true, "the main portal keeps the tool");
+  assert.deepEqual([s.collections[0].code_mode, s.portal.code_mode], ["enforced", "opt_in"]);
+
+  // Membership: add keeps everyone else's settings, remove takes one out.
+  assert.equal((await call("PUT", "/api/collections/personal", { add: ["linear"], remove: ["garmin"] })).status, 200);
+  assert.deepEqual(fake.portals.get("runkle-personal").servers.map((m: any) => [m.server_id, m.updated_tools.length]), [["notes", 1], ["linear", 0]]);
+  assert.equal((await call("PUT", "/api/collections/personal", { add: ["nope"] })).status, 400);
+  assert.equal((await call("POST", "/api/collections", { name: "personal" })).status, 400, "one collection per name");
+  assert.equal((await call("POST", "/api/collections", { name: "Work", integrations: ["nope"] })).status, 400);
+  assert.ok(!fake.portals.has("runkle-work"), "a refused collection makes nothing");
+
+  // Removing an integration takes it out of every collection first.
+  await call("DELETE", "/api/integrations/linear");
+  assert.deepEqual(fake.portals.get("runkle-personal").servers.map((m: any) => m.server_id), ["notes"]);
+
+  // A collection that fails halfway leaves nothing behind.
+  const before = { dns: fake.dns.size, apps: fake.apps.size };
+  fake.portals.set("other", { id: "other", name: "Hand-made", hostname: "mcp-work.example.com", servers: [] });
+  assert.equal((await call("POST", "/api/collections", { name: "Work" })).status, 502);
+  assert.deepEqual([fake.dns.size, fake.apps.size, fake.portals.has("runkle-work")], [before.dns, before.apps, false]);
+
+  // runkle deletes only collections it made, never the main portal or another one.
+  assert.equal((await call("DELETE", "/api/collections/main")).status, 400);
+  assert.equal((await call("DELETE", "/api/collections/other")).status, 400);
+  assert.equal((await call("DELETE", "/api/collections/personal")).status, 200);
+  assert.ok(!fake.portals.has("runkle-personal") && fake.portals.has("main") && fake.portals.has("other"));
+  assert.ok(![...fake.dns.values()].some((r) => r.name === "mcp-personal.example.com"));
+  assert.ok(![...fake.apps.values()].some((a) => a.domain === "mcp-personal.example.com"));
+  assert.ok(fake.servers.has("notes"), "integrations outlive the collection");
+});
+
 test("refuses unauthenticated and cross-origin requests", async () => {
   const locked = { ...env, AUTH_DISABLED: undefined };
   assert.equal((await worker.fetch(new Request(origin + "/api/state"), locked, {} as ExecutionContext)).status, 401);
@@ -218,7 +291,7 @@ test("an app's storage, skills, schedules, webhooks, pages and workflows", async
   assert.deepEqual(script().schedules, [{ cron: "0 6 * * *" }]);
   assert.deepEqual(fake.workflows.get("runkle-app-rich"), { class_name: "Flow", script_name: "runkle-app-rich" });
   const [open, gate] = [...fake.apps.values()].filter((a) => a.type === "self_hosted");
-  assert.deepEqual(open.destinations.map((d: any) => d.uri), ["mcp", "webhooks", "manifest"].map((area) => `runkle-app-rich.acme.workers.dev/${area}`));
+  assert.deepEqual(open.destinations.map((d: any) => d.uri), ["mcp", "webhooks", "manifest", "vault"].map((area) => `runkle-app-rich.acme.workers.dev/${area}`));
   assert.equal(open.policies[0].decision, "bypass");
   assert.equal(gate.domain, "runkle-app-rich.acme.workers.dev");
   assert.deepEqual(gate.policies, [{ id: "pol-1", precedence: 1 }], "pages get the portal's Access policies");
@@ -767,6 +840,320 @@ test("runkle's own MCP server tells agents how to use the portal and what an add
   const out = JSON.parse(added.content[0].text);
   assert.equal(out.id, "playbooks");
   assert.match(out.next_steps, /reconnects this portal's connector.*fresh session.*update_api_source or update_script/);
+});
+
+// ---- Integration health ----
+
+test("secretReads finds the env names a module reads, and what a generated API needs", async () => {
+  const { secretReads } = await import("../src/health.ts");
+  const { sourceApp } = await import("../src/sources.ts");
+  const script = `const { GARMIN_EMAIL, PASSWORD: pw } = env; run(i, env) { return env.GARMIN_TOKEN + env["OTHER_KEY"] + secrets?.THIRD + env.RUNKLE_APP + env.lowercase; }`;
+  assert.deepEqual(secretReads(script).sort(), ["GARMIN_EMAIL", "GARMIN_TOKEN", "OTHER_KEY", "PASSWORD", "THIRD"]);
+  const open = await sourceApp({ kind: "openapi", spec: OPENAPI, auth: "none", secret_headers: { "x-tunnel-pass": "TUNNEL_PASS" } });
+  assert.deepEqual(secretReads(open), ["TUNNEL_PASS"], "an open API needs no API_TOKEN, though its client code mentions one");
+  assert.deepEqual(secretReads(await sourceApp({ kind: "openapi", spec: OPENAPI, auth: "bearer" })), ["API_TOKEN"]);
+});
+
+const DAY = 24 * 60 * 60 * 1000;
+const inDays = (n: number) => new Date(Date.now() + n * DAY).toISOString().slice(0, 10);
+
+test("a health check finds broken, unused and expiring secrets, alerts once per problem and closes what was fixed", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  await call("POST", "/api/push", { subscription: await browser("https://fcm.push.test/h") });
+
+  const garmin = `export const tools = { me: { run: (i, env) => env.GARMIN_TOKEN } };
+export const probe = async (env) => { if (env.GARMIN_TOKEN !== "good") throw new Error("HTTP 400: invalid API key"); };`;
+  const made = await call("POST", "/api/apps", { name: "Garmin", source: garmin, secrets: { GARMIN_TOKEN: "bad", GARMIN_EMAIL: "me@example.com" }, expires: { GARMIN_TOKEN: inDays(5) } });
+  assert.equal(made.status, 200);
+  await call("POST", "/api/sources", { name: "Dokploy", kind: "openapi", spec: OPENAPI, auth: "none", secret_headers: { "x-tunnel-pass": "TUNNEL_PASS" } });
+  await call("POST", "/api/integrations", { name: "Linear", url: "https://linear.example/mcp", auth: "oauth" });
+  await call("POST", "/api/skills", { name: "Notes", skills: [{ name: "n", description: "d", content: "# n" }] });
+  assert.deepEqual(await (await call("GET", "/api/health")).json(), {}, "nothing is reported before the first check");
+
+  const report: any = await (await call("POST", "/api/health")).json();
+  const by = Object.fromEntries(report.integrations.map((i: any) => [i.id, i]));
+  assert.equal(by.garmin.status, "upstream_error", "the worst problem names the status");
+  assert.deepEqual(by.garmin.problems.map((p: any) => [p.kind, p.secret]), [["upstream_error", undefined], ["expiring", "GARMIN_TOKEN"], ["unused_secret", "GARMIN_EMAIL"]]);
+  assert.match(by.garmin.problems[0].reason, /probe failed: HTTP 400: invalid API key/);
+  assert.match(by.garmin.problems[1].reason, new RegExp(`GARMIN_TOKEN expires on ${inDays(5)}, in [45] days`));
+  assert.deepEqual(by.dokploy.problems.map((p: any) => [p.kind, p.secret]), [["missing_secret", "TUNNEL_PASS"]]);
+  assert.match(by.dokploy.note, /declares no probe/);
+  assert.equal(by.linear.status, "needs_sign_in");
+  assert.deepEqual([by.notes.status, by.notes.problems], ["ok", []]);
+  for (const i of report.integrations) for (const p of i.problems) assert.ok(p.reason && p.fix, "every problem says why and what to do");
+  assert.ok(!JSON.stringify(report).includes("me@example.com") && !JSON.stringify(report).includes('"bad"'), "no secret value reaches the report");
+
+  const alerts = async () => ((await (await call("GET", "/api/inbox")).json()) as any).waiting.filter((i: any) => i.kind === "alert").map((i: any) => i.id).sort();
+  assert.deepEqual(await alerts(), [
+    "health:dokploy:missing-secret:tunnel-pass",
+    "health:garmin:expiring:garmin-token",
+    "health:garmin:unused-secret:garmin-email",
+    "health:garmin:upstream-error",
+    "health:linear:needs-sign-in",
+  ]);
+  assert.equal(fake.pushes.length, 5, "one notification per new problem");
+  assert.deepEqual(((await (await call("GET", "/api/health")).json()) as any).checked_at, report.checked_at, "the UI reads the last report");
+
+  // The daily run finds the same problems: the same items, nobody notified again.
+  const waits: Promise<unknown>[] = [];
+  await worker.scheduled({} as ScheduledController, env, { waitUntil: (p: Promise<unknown>) => waits.push(p) } as unknown as ExecutionContext);
+  await Promise.all(waits);
+  assert.equal((await alerts()).length, 5);
+  assert.equal(fake.pushes.length, 5);
+
+  // Fixed: a good key without a date, the tunnel pass set. Their alerts close at the next check.
+  await call("PUT", "/api/apps/garmin", { secrets: { GARMIN_TOKEN: "good" } });
+  await call("PUT", "/api/apps/dokploy", { secrets: { TUNNEL_PASS: "p" }, expires: { TUNNEL_PASS: "2027-11-19" } });
+  const state: any = await (await call("GET", "/api/state")).json();
+  assert.equal(state.integrations.find((i: any) => i.id === "garmin").secret_expiry, undefined, "a new value drops the old value's date");
+  assert.deepEqual(state.integrations.find((i: any) => i.id === "dokploy").secret_expiry, { TUNNEL_PASS: "2027-11-19" });
+  await call("POST", "/api/health");
+  assert.deepEqual(await alerts(), ["health:garmin:unused-secret:garmin-email", "health:linear:needs-sign-in"]);
+
+  // A probe answers only the one request runkle put a key in its inbox for.
+  const app = await fake.app("runkle-app-garmin");
+  const probe = (key: string) => app.worker.fetch(new Request("https://runkle-app-garmin.acme.workers.dev/manifest/probe", { headers: { Authorization: `Bearer ${key}` } }), app.env);
+  assert.equal((await probe("guess")).status, 401);
+  const key = "k".repeat(64);
+  await latest!.inbox.get({} as any).fetch("https://inbox/", { method: "POST", body: JSON.stringify({ op: "probe_key", app: "dokploy", key }) });
+  assert.equal((await probe(key)).status, 401, "a key for another app does not work");
+
+  // Removing an integration forgets its dates and, at the next check, its alerts.
+  await call("DELETE", "/api/integrations/dokploy");
+  assert.ok(![...fake.inboxData.keys()].includes("expiry:dokploy"));
+});
+
+test("dates are entered beside values and agents can record them, never a value", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  await call("POST", "/api/apps", { name: "Shots", source: `export const tools = { t: { run: (i, env) => env.SHOT_TOKEN } };`, secrets: { SHOT_TOKEN: "s" } });
+  assert.equal((await call("PUT", "/api/apps/shots", { secrets: { SHOT_TOKEN: "s2" }, expires: { SHOT_TOKEN: "2026-02-30" } })).status, 400);
+  assert.equal((await call("PUT", "/api/apps/shots", { secrets: { SHOT_TOKEN: "s2" }, expires: { OTHER: "2027-01-01" } })).status, 400, "a date needs its value");
+
+  const mcp = async (name: string, args: unknown) => {
+    const response = await call("POST", "/mcp", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, { "Content-Type": "application/json", Accept: "application/json, text/event-stream" });
+    return JSON.parse((await response.text()).match(/^data: (.*)$/m)![1]).result;
+  };
+  const set = await mcp("set_secret_expiry", { id: "shots", name: "SHOT_TOKEN", expires: inDays(90) });
+  assert.deepEqual(JSON.parse(set.content[0].text), { secret_expiry: { SHOT_TOKEN: inDays(90) } });
+  assert.equal((await mcp("set_secret_expiry", { id: "shots", name: "NOPE", expires: inDays(1) })).isError, true);
+  assert.equal((await mcp("set_secret_expiry", { id: "shots", name: "SHOT_TOKEN", expires: "soon" })).isError, true);
+
+  const checked = JSON.parse((await mcp("check_integrations", {})).content[0].text);
+  assert.deepEqual(checked.integrations.map((i: any) => [i.id, i.status]), [["shots", "ok"]], "90 days out is not a problem yet");
+  assert.match(checked.sign_in, /out of runkle's sight/);
+  assert.deepEqual(((await (await call("GET", "/api/inbox")).json()) as any).waiting, [], "an agent's check alerts no one");
+
+  await mcp("set_secret_expiry", { id: "shots", name: "SHOT_TOKEN", expires: inDays(-1) });
+  const expired = JSON.parse((await mcp("check_integrations", {})).content[0].text).integrations[0];
+  assert.match(expired.problems[0].reason, /SHOT_TOKEN expired on/);
+  await mcp("set_secret_expiry", { id: "shots", name: "SHOT_TOKEN", expires: null });
+  assert.equal(((await (await call("GET", "/api/state")).json()) as any).integrations[0].secret_expiry, undefined);
+});
+
+// A 1Password Connect server at op.example.com, in memory, with the "Agents" vault. Everything else goes to the fake Cloudflare.
+function connect(t: any, fake: ReturnType<typeof fakeCloudflare>) {
+  const vault = { id: "v".repeat(26), name: "Agents", items: 1 };
+  const items = new Map<string, any>([
+    ["i".repeat(26), {
+      id: "i".repeat(26), title: "Discogs", category: "LOGIN", tags: ["music"], urls: [{ href: "https://discogs.com" }], updatedAt: "2025-01-01T00:00:00Z",
+      fields: [
+        { id: "username", label: "username", type: "STRING", purpose: "USERNAME", value: "jay" },
+        { id: "password", label: "password", type: "CONCEALED", purpose: "PASSWORD", value: "old-pw" },
+      ],
+    }],
+  ]);
+  const writes: any[] = [], seen: string[] = [];
+  let made = 0;
+  t.mock.method(globalThis, "fetch", async (input: any, init: any) => {
+    const request = new Request(input, init), url = new URL(request.url);
+    if (url.hostname !== "op.example.com") return fake.handle(request);
+    assert.equal(request.headers.get("Authorization"), "Bearer connect-token");
+    const text = request.body ? await request.text() : "";
+    seen.push(text);
+    const body: any = text ? JSON.parse(text) : undefined;
+    // What Connect does with generate: makes the value itself.
+    const stored = (i: any) => ({ ...i, fields: i.fields.map(({ generate, recipe, ...f }: any) => (generate ? { ...f, id: f.id ?? "f" + ++made, value: `generated-${recipe.length}-${++made}` } : { ...f, id: f.id ?? "f" + ++made })) });
+    const at = `${request.method} ${url.pathname}`, filter = url.searchParams.get("filter");
+    const itemPath = new RegExp(`^/v1/vaults/${vault.id}/items/([a-z0-9]+)$`);
+    if (at === "GET /v1/vaults") return Response.json(filter && filter !== 'name eq "Agents"' ? [] : [vault]);
+    if (at === `GET /v1/vaults/${vault.id}/items`)
+      return Response.json([...items.values()].filter((i) => !filter || filter === `title eq "${i.title}"`).map(({ fields, ...summary }) => summary));
+    const [, itemId] = url.pathname.match(itemPath) ?? [];
+    if (request.method === "GET" && itemId) return Response.json(items.get(itemId));
+    if (request.method === "PUT" && itemId) return writes.push(body), items.set(itemId, stored(body)), Response.json(items.get(itemId));
+    if (at === `POST /v1/vaults/${vault.id}/items`) {
+      // A Connect error that quotes what it was sent, as some do.
+      if (body.title === "Rejected") return Response.json({ message: `invalid item: ${JSON.stringify(body.fields)}` }, { status: 400 });
+      const item = { ...stored(body), id: String(++made).padStart(26, "n") };
+      return writes.push(body), items.set(item.id, item), Response.json(item);
+    }
+    return Response.json({ message: "not found" }, { status: 404 });
+  });
+  const secrets = { OP_CONNECT_HOST: "https://op.example.com/", OP_CONNECT_TOKEN: "connect-token" };
+  const byTitle = (title: string) => [...items.values()].find((i) => i.title === title);
+  return { items, writes, seen, secrets, byTitle };
+}
+
+test("1Password: metadata is free, values and writes ask first, and no tool takes a secret", async (t) => {
+  const fake = fakeCloudflare();
+  const op = connect(t, fake);
+  const item = op.byTitle("Discogs");
+  const { made: app, tool, approved } = await readyMade(fake, "onepassword.js", "1Password", op.secrets);
+  assert.deepEqual(app.approvals, ["read_secret", "create_item", "generate_field", "copy_field"]);
+  assert.ok(!app.tools.includes("vault"), "keeping a copy is not a tool: no agent can hand it a value");
+  const discogs = { vault: "Agents", item: "Discogs" };
+  const values = /old-pw|generated-/;
+
+  // Free: where things are and what they are called, never what they hold.
+  const free = [await tool("list_vaults"), await tool("list_items", { vault: "Agents", search: "disc" }), await tool("get_item", discogs)];
+  assert.ok(!values.test(JSON.stringify(free)));
+  assert.deepEqual(free[2].fields.map((f: any) => [f.label, f.value, f.filled]), [["username", "jay", true], ["password", undefined, true]]);
+  assert.match((await tool("get_item", { vault: "Personal", item: "Bank" })).error, /No vault called "Personal"/, "only the vaults the token covers");
+
+  // Rotation without anyone seeing a value: generate into a spare field, then copy it over the live one.
+  const staged = await approved("generate_field", { ...discogs, field: "staged password", symbols: false }, /Set "staged password" of item "Discogs" in vault "Agents" with a newly generated value/);
+  assert.ok(!values.test(JSON.stringify(staged)));
+  assert.deepEqual(op.writes[0].fields[2], { type: "CONCEALED", label: "staged password", generate: true, recipe: { length: 32, characterSets: ["LETTERS", "DIGITS"] } });
+  await approved("copy_field", { ...discogs, from: "staged password", to: "password" }, /Copy "staged password" over "password".*history/s);
+  const now = op.byTitle("Discogs");
+  assert.match(now.fields[1].value, /^generated-32-/);
+  assert.equal(now.fields[1].value, now.fields[2].value);
+  assert.match((await tool("copy_field", { ...discogs, from: "nope", to: "password" })).error, /No field called "nope"/);
+
+  // Reading a value into the conversation is possible, and always asked.
+  assert.equal(await approved("read_secret", { ...discogs, field: "password" }, /Show the agent the value of "password" from item "Discogs".*conversation/s), now.fields[1].value);
+
+  const created = await approved("create_item", { vault: "Agents", title: "New API", username: "bot", generate_password: true, length: 20 }, /Create the item "New API" in vault "Agents" with a generated password/);
+  assert.ok(created.id && !values.test(JSON.stringify(created)));
+  assert.equal(op.writes.length, 3, "each write ran once, after approval");
+  void item;
+});
+
+test("generate_secret: asked first, set once, kept in 1Password, and never seen", async (t) => {
+  const fake = fakeCloudflare();
+  const op = connect(t, fake);
+  const logged: string[] = [];
+  for (const level of ["log", "info", "warn", "error", "debug"] as const) t.mock.method(console, level, (...args: unknown[]) => void logged.push(args.map(String).join(" ")));
+  const { generateSecret } = await import("../src/ops.ts");
+  const said: string[] = []; // everything runkle answered, to search for the value
+  const answer = async (response: Response) => (said.push(await response.clone().text()), response.json() as Promise<any>);
+
+  await call("POST", "/api/apps", { name: "Hooks", source: SCRIPT, secrets: { KEY: "k" } });
+  await call("POST", "/api/apps", { name: "New", source: SCRIPT });
+  await readyMade(fake, "onepassword.js", "1Password", op.secrets);
+  await call("POST", "/api/integrations", { name: "Upstream", url: "https://upstream.example/mcp", auth: "bearer", token: "old-token" });
+  await call("POST", "/api/integrations", { name: "Docs", url: "https://docs.example/mcp", auth: "none" });
+
+  // Through runkle's own MCP endpoint, as an agent calls it.
+  const mcp = async (args: unknown) => {
+    const response = await call("POST", "/mcp", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "generate_secret", arguments: args } }, { "Content-Type": "application/json", Accept: "application/json, text/event-stream" });
+    const text = await response.text();
+    said.push(text);
+    const result = JSON.parse(text.match(/^data: (.*)$/m)![1]).result;
+    return result.isError ? { error: result.content[0].text } : JSON.parse(result.content[0].text);
+  };
+  const request = {
+    targets: [{ app: "hooks", secret: "WEBHOOK_SECRET" }, { server: "upstream" }],
+    length: 48,
+    copy_to: { app: "1password", vault: "Agents", item: "Upstream webhook", field: "token" },
+  };
+  const hooks = () => fake.scripts.get("runkle-app-hooks")!.secrets;
+  const nothingSet = () => {
+    assert.equal(hooks().WEBHOOK_SECRET, undefined);
+    assert.equal(fake.credentials.get("upstream"), "old-token");
+    assert.equal(op.byTitle("Upstream webhook"), undefined);
+  };
+
+  // The rules are checked before anyone is asked.
+  assert.match((await mcp({ targets: [{ app: "hooks", secret: "RUNKLE_TOKEN" }] })).error, /reserved/);
+  assert.match((await mcp({ targets: [{ app: "docs", secret: "X" }] })).error, /No script/);
+  assert.match((await mcp({ targets: [{ server: "hooks" }] })).error, /runkle's to manage/);
+  assert.match((await mcp({ targets: [{ server: "docs" }] })).error, /bearer/);
+  assert.match((await mcp({ targets: [{ app: "hooks", secret: "A" }], length: 8 })).error, /16 to 128/);
+  assert.match((await mcp({ ...request, copy_to: { ...request.copy_to, app: "new" } })).error, /holds no secrets/, "a vault app's code must be reviewed code");
+  assert.deepEqual(((await answer(await call("GET", "/api/inbox"))) as any).waiting, []);
+
+  const asked = await mcp(request);
+  assert.match(asked.waiting_for_approval, /^https:\/\/runkle\.test\/#inbox=[0-9a-f]{32}$/);
+  assert.match(asked.next, /same arguments/);
+  nothingSet();
+  assert.equal((await mcp({ copy_to: request.copy_to, length: 48, targets: request.targets })).waiting_for_approval, asked.waiting_for_approval, "asking again, in any key order, finds the same request");
+  nothingSet();
+
+  // The person sees where it goes and where the copy is kept: names, never a value (there is none yet).
+  const id = new URLSearchParams(new URL(asked.waiting_for_approval).hash.slice(1)).get("inbox")!;
+  const [item] = (await answer(await call("GET", "/api/inbox"))).waiting;
+  assert.deepEqual([item.id, item.kind, item.app, item.tool], [id, "approval", "runkle", "generate_secret"]);
+  assert.deepEqual(item.input, { targets: request.targets, length: 48, alphabet: "alphanumeric", copy_to: request.copy_to });
+  assert.equal(
+    item.title,
+    'Generate a 48-character alphanumeric secret and set it as WEBHOOK_SECRET on hooks and as the bearer token the portal sends to upstream. Keep a copy in vault "Agents", item "Upstream webhook", field "token" (through 1password). Nobody sees the value.',
+  );
+  assert.equal((await call("POST", `/api/inbox/${id}`, { approve: true })).status, 200);
+
+  const done = await mcp(request);
+  assert.deepEqual(done.set, ["WEBHOOK_SECRET on hooks", "bearer token of upstream"]);
+  assert.deepEqual(done.copy, { vault: "Agents", item: "Upstream webhook", field: "token" });
+  const value = hooks().WEBHOOK_SECRET;
+  assert.match(value, /^[A-Za-z0-9]{48}$/);
+  assert.equal(fake.credentials.get("upstream"), value, "the portal sends the same value upstream");
+  assert.equal(fake.servers.get("upstream").name, "Upstream");
+  const kept = op.byTitle("Upstream webhook");
+  assert.deepEqual([kept.category, kept.tags, kept.fields.map((f: any) => [f.label, f.type, f.value])], ["LOGIN", ["runkle"], [["token", "CONCEALED", value]]]);
+  assert.match((await mcp(request)).waiting_for_approval, /#inbox=/, "an approval runs once");
+
+  // Which secrets have a copy, by name only.
+  const listed = (await answer(await call("GET", "/api/state"))).integrations.find((i: any) => i.id === "hooks");
+  assert.deepEqual([listed.secrets_set, listed.secrets_copied], [["KEY", "WEBHOOK_SECRET"], ["WEBHOOK_SECRET"]]);
+  assert.equal(await (await fake.app("runkle-app-hooks")).env.RUNKLE_COPY_WEBHOOK_SECRET, "1");
+  const ran = JSON.parse((await callTool(fake, "runkle-app-hooks", "whoami")).text);
+  assert.equal(ran.sawPortalToken, false, "the mark is runkle's and never reaches the script");
+
+  // Generating again into the same item replaces the field; the old value stays in 1Password's history.
+  const again = { targets: [{ app: "hooks", secret: "WEBHOOK_SECRET" }], alphabet: "hex", copy_to: request.copy_to };
+  const second = await generateSecret(env, origin, again, "dev@localhost"); // from runkle's own UI: the person is the approval
+  said.push(JSON.stringify(second));
+  assert.match(hooks().WEBHOOK_SECRET, /^[0-9a-f]{40}$/);
+  assert.deepEqual(op.byTitle("Upstream webhook").fields.map((f: any) => f.value), [hooks().WEBHOOK_SECRET]);
+  const values = [value, hooks().WEBHOOK_SECRET];
+
+  // A value typed by hand has no copy anywhere: the mark goes.
+  await call("PUT", "/api/apps/hooks", { secrets: { WEBHOOK_SECRET: "typed" } });
+  assert.deepEqual((await answer(await call("GET", "/api/state"))).integrations.find((i: any) => i.id === "hooks").secrets_copied, []);
+
+  // The UI route needs a person's request from runkle's own page.
+  assert.equal((await call("POST", "/api/generate", { targets: [{ app: "hooks", secret: "OTHER" }] }, {})).status, 403);
+  const fromUi = await answer(await call("POST", "/api/generate", { targets: [{ app: "new", secret: "SIGNING_KEY" }], alphabet: "base64url", length: 64 }));
+  assert.deepEqual(fromUi.set, ["SIGNING_KEY on new"]);
+  values.push(fake.scripts.get("runkle-app-new")!.secrets.SIGNING_KEY);
+  assert.match(values[2], /^[A-Za-z0-9_-]{64}$/);
+
+  // A failed copy sets nothing, and its error never carries the value.
+  const rejected = { targets: [{ app: "hooks", secret: "LATER" }], copy_to: { ...request.copy_to, item: "Rejected" } };
+  await assert.rejects(generateSecret(env, origin, rejected, "dev@localhost"), (error: Error) => {
+    said.push(error.message);
+    assert.match(error.message, /Keeping a copy failed: 1Password: invalid item: .*\[the generated value\]/);
+    return true;
+  });
+  assert.equal(hooks().LATER, undefined);
+  values.push(JSON.parse(op.seen.filter((s) => s.includes("Rejected")).at(-1)!).fields[0].value);
+  await assert.rejects(generateSecret(env, origin, { targets: [{ app: "hooks", secret: "LATER" }], copy_to: { ...request.copy_to, app: "hooks" } }, "dev@localhost"), /hooks cannot keep copies: its script exports no vault/);
+  assert.equal(hooks().LATER, undefined);
+
+  // An agent sees none of it: not in any answer, the inbox, a log, or the vault app's tools and storage.
+  const tools = await Promise.all([callTool(fake, "runkle-app-1password", "list_items", { vault: "Agents" }), callTool(fake, "runkle-app-1password", "get_item", { vault: "Agents", item: "Upstream webhook" })]);
+  said.push(JSON.stringify(tools), await (await call("GET", "/api/state")).text(), await (await call("GET", "/api/inbox")).text());
+  const everywhere = [...said, JSON.stringify([...fake.inboxData]), ...logged, JSON.stringify([...fake.scripts.get("runkle-app-1password")!.data])].join("\n");
+  for (const v of values) assert.ok(v && !everywhere.includes(v), "the generated value never leaves where it was put");
+
+  // Denied is final.
+  const denied = { targets: [{ app: "hooks", secret: "NOPE" }] };
+  const deniedId = new URLSearchParams(new URL((await mcp(denied)).waiting_for_approval).hash.slice(1)).get("inbox")!;
+  await call("POST", `/api/inbox/${deniedId}`, { approve: false });
+  assert.match((await mcp(denied)).error, /Denied by dev@localhost/);
+  assert.equal(hooks().NOPE, undefined);
 });
 
 test("Fastmail: reading and drafting pass straight through, sending and changing ask first", async (t) => {

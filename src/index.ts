@@ -31,7 +31,8 @@ function route(request: Request, env: Env, me: string): (() => Promise<unknown>)
   const key = `${request.method} ${pathname}`;
   const body = () => request.json().catch(() => ({})) as Promise<any>;
   const id = pathname.match(/^\/api\/(?:integrations|apps)\/([a-z0-9-]{1,32})(?:\/|$)/)?.[1];
-  const item = pathname.match(/^\/api\/inbox\/([a-z0-9:-]{1,80})$/)?.[1];
+  const item = pathname.match(/^\/api\/inbox\/([a-z0-9:-]{1,128})$/)?.[1];
+  const collection = pathname.match(/^\/api\/collections\/([a-z0-9-]{1,24})$/)?.[1];
 
   if (key === "GET /api/state") return () => ops.state(env, me);
   if (key === "POST /api/integrations") return async () => ops.registerServer(env, serverBody(await body()));
@@ -40,22 +41,34 @@ function route(request: Request, env: Env, me: string): (() => Promise<unknown>)
   if (key === "POST /api/skills") return async () => ops.newSkills(env, ui, await body());
   if (key === "PUT /api/agent-auth") return async () => ops.setAgentAuth(env, await body());
   if (key === "PUT /api/portal") return async () => ops.setCodeMode(env, await body());
+  if (key === "POST /api/collections") return async () => ops.createCollection(env, await body());
+  if (collection && key === `PUT /api/collections/${collection}`) return async () => ops.setCollection(env, collection, await body());
+  if (collection && key === `DELETE /api/collections/${collection}`) return () => ops.deleteCollection(env, collection);
   if (id && key === `PUT /api/apps/${id}`) return async () => ops.changeApp(env, ui, id, await body());
+  // A person generating a secret from the UI is the approval; an agent's generate_secret waits in the inbox.
+  if (key === "POST /api/generate") return async () => ops.generateSecret(env, ui, await body(), me);
   // Deciding on an agent's proposed change is for people only: there is no MCP tool for it.
   if (id && key === `GET /api/apps/${id}/proposal`) return () => ops.reviewChange(env, id);
   if (id && key === `POST /api/apps/${id}/proposal`) return async () => ops.decideChange(env, ui, id, await body(), me);
   // The inbox decides for a person, so like reviews it has no MCP tool.
   if (key === "GET /api/inbox") return () => ops.inboxList(env);
   if (item && key === `POST /api/inbox/${item}`) return async () => ops.inboxDecide(env, item, await body(), me);
-  if (key === "POST /api/push") return async () => ops.subscribe(env, await body(), me);
+  if (key === "POST /api/push") return async () => ops.subscribe(env, await body(), me, ui);
   if (key === "DELETE /api/push") return async () => ops.unsubscribe(env, await body());
   if (key === "POST /api/push/test") return () => ops.testPush(env, ui);
+  if (key === "GET /api/health") return () => ops.lastHealth(env);
+  if (key === "POST /api/health") return () => ops.checkAndAlert(env, ui);
   if (id && key === `DELETE /api/integrations/${id}`) return () => ops.removeIntegration(env, id);
   if (id && key === `POST /api/integrations/${id}/sync`) return () => ops.syncServer(env, id);
   if (id && key === `PUT /api/integrations/${id}/tools`) return async () => ops.toggleTool(env, id, await body());
 }
 
 export default {
+  // Daily (wrangler.jsonc): check every integration and alert the person about problems.
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(ops.checkAndAlert(env));
+  },
+
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const me = await signedInEmail(request, env);
     if (!me) return json({ error: "Not signed in through Cloudflare Access" }, 401);

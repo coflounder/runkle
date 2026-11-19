@@ -10,7 +10,7 @@ Cloudflare only.
 | MCP endpoint | Cloudflare MCP server portal | already aggregates servers, stores per-user upstream tokens, filters tools, logs calls |
 | agent sign-in | Access managed OAuth on the portal | OAuth authorization server with client registration, no code |
 | UI sign-in | Cloudflare Access in front of the Worker; Worker verifies the Access JWT with `jose` | no user table, no sessions |
-| database | one Durable Object, the inbox (`src/inbox.ts`) | everything runkle manages is already stored by Cloudflare; the Worker is a thin, opinionated client of the Cloudflare API. The inbox holds only what waits for a person, its decisions, and push subscriptions |
+| database | one Durable Object, the inbox (`src/inbox.ts`) | everything runkle manages is already stored by Cloudflare; the Worker is a thin, opinionated client of the Cloudflare API. The inbox holds only what waits for a person, its decisions, push subscriptions, and what the health check needs (secret expiry dates, the last report, one-use probe keys) |
 | secrets | one Worker secret, `CLOUDFLARE_API_TOKEN` | upstream client secrets and tokens are written straight to Cloudflare and never read back |
 
 ## Where things live
@@ -33,16 +33,30 @@ Cloudflare only.
 | POST `/api/integrations/:id/sync` | re-fetch tools | POST server sync |
 | PUT `/api/integrations/:id/tools` | allow or block one tool | PUT portal |
 | PUT `/api/agent-auth` | managed OAuth on/off, localhost/loopback, allowed redirect URIs | GET + PUT access app |
-| PUT `/api/portal` | code mode | PUT portal |
+| PUT `/api/portal` | code mode, of the main portal or with `collection` of one collection | PUT portal |
+| POST `/api/collections` | make a collection: DNS record like the main portal's, portal `runkle-<id>` with the chosen integrations' main-portal mappings, `mcp_portal` Access app with the main portal's policies and OAuth settings; rolled back on failure | GET zones, GET + POST dns_records, POST portal, POST access app |
+| PUT `/api/collections/:id` | add or remove integrations | GET portals, PUT portal |
+| DELETE `/api/collections/:id` | delete the portal, then its Access app, then the DNS record runkle made (found by its comment) | DELETE portal, DELETE access app, DELETE dns_record |
 | POST `/api/apps` | deploy an uploaded script as a Worker with its secrets, register it | PUT worker script, POST subdomain, then as POST `/api/integrations` |
 | PUT `/api/apps/:id` | replace a script's source, set secrets, and/or set its ask-first list (UI only for the list) | PUT worker script or PUT worker secrets |
 | GET, POST `/api/apps/:id/proposal` | read an agent's proposed change to a script; approve or reject it (UI only, no MCP tool) | GET worker versions and deployments, then as PUT `/api/apps/:id` |
 | POST `/api/sources` | generate an app from an OpenAPI or Discovery document or a GraphQL endpoint, then as POST `/api/apps` | (fetches the document), then as above |
 | POST `/api/skills` | generate an app that only carries skills, then as POST `/api/apps` | as above |
-| POST `/mcp` | the operations above as MCP tools, minus anything that carries a secret | as above |
+| GET, POST `/api/health` | the last health report; run the check now and update its inbox alerts | GET portal, GET access apps, per app GET worker settings, versions, deployments and its source, then the app's `/manifest/probe` |
+| POST `/api/generate` | generate a secret and set it on apps and/or a server's bearer token, keeping a copy if asked (a person's request: no inbox item) | PUT worker secrets, PUT server, then the vault app's `/vault` |
+| POST `/mcp` | the operations above as MCP tools, minus anything that carries a secret; `generate_secret` waits for approval in the inbox | as above |
 
 Token permissions: `MCP Portals Write`, `Access: Apps and Policies Write`,
-`Workers Scripts Write`.
+`Workers Scripts Write`; for collections, `Zone Read` and `DNS Edit` on the
+portal's zone.
+
+A collection is a second portal (`runkle-<id>`) with a subset of the main
+portal's servers. Every integration is registered in the main portal, which
+apps, health checks and generated secrets keep using; a collection only
+points at servers that already exist. Each server's own Access app applies in
+every portal it is in, so a collection narrows what an agent sees but not who
+may use a server. Removing an integration detaches it from every collection
+first.
 
 ## Uploaded scripts
 
@@ -102,6 +116,48 @@ returns secrets (Dokploy returns an app's env) never hands them to an agent.
 `update_api_source` regenerates a source in place, keeping its id, secrets and
 portal registration; like any agent change to a script with secrets, it waits
 for review.
+
+## Generated secrets
+
+`generate_secret` (`generateSecret` in `src/ops.ts`, the pure part in
+`src/generate.ts`) is the one MCP tool that changes a credential, so it asks
+first the same way an app's gated tool does: the normalized request (targets,
+length, alphabet, where to keep a copy) is an `approval` item whose id is a
+SHA-256 of it, the agent gets a link, and its repeated call runs once after a
+person approves. Every rule is checked before the item is opened. The value
+does not exist until then: it is made in the call that runs, with
+`crypto.getRandomValues` and rejection sampling, and lives only in that call.
+
+| step | where it goes |
+| --- | --- |
+| 1. copy, if asked | the vault app's `/vault`, see below. First, so a value never goes live with no copy |
+| 2. targets | `PUT workers/scripts/runkle-app-<id>/secrets` per app secret; `PUT access/ai-controls/mcp/servers/<id>` with `auth_credentials` per remote bearer server |
+| 3. mark | `RUNKLE_COPY_<NAME>`, a secret binding on the app whose value says nothing. Its name is how `appConfig` reports `secrets_copied`. A value set by hand deletes it |
+
+Error text from any step has the value replaced before it is returned. A
+person generating from the UI (`POST /api/generate`) is their own approval.
+
+A copy goes to a runkle app that exports `vault` (`scripts/onepassword.js`,
+which writes to a 1Password Connect server), because the 1Password credential
+must live as an app's secret, not runkle's. runkle sets a fresh key as the
+app's `RUNKLE_SETUP` (the same secret it reads `/manifest` with), then POSTs
+the value to the app's `/vault` with it; the entry module checks the key and
+hands the value to `vault.save` as an argument. The app's env never holds it,
+no MCP tool reaches `vault`, and runkle keeps neither the key nor the value.
+Setting the key is a Worker deployment, so the call retries on 401 for a few
+seconds while it spreads. The vault app must hold secrets, so its code is
+reviewed code.
+
+Why Connect and not a service account: service accounts have no HTTP API
+(only the `op` CLI and the Go, JavaScript and Python SDKs), and the JavaScript
+SDK's WebAssembly core is loaded with `fs.readFileSync(__dirname + ...)`, which
+Workers cannot run (onepassword-sdk-js#184, open). Bundling a patched 14 MB
+core would also need a WebAssembly module in an app's upload, which apps do not take.
+
+Not covered: a target script that holds no secrets can be one an agent wrote,
+and its code can read the value; the approval says so. And a portal server's
+new token is only useful once the upstream server has the same value, which
+is what the copy is for.
 
 ## Credential links
 
@@ -177,6 +233,40 @@ Not covered:
   gated tools refuse to run, and say so, until the app is updated in runkle.
 - **iPhone and iPad** only offer push to the app opened from the Home Screen.
 
+## Health
+
+`src/health.ts` checks every integration with what runkle can see without
+anyone's token, and nothing it does changes an integration.
+
+| signal | from |
+| --- | --- |
+| last sync failed, admin sign-in missing | the portal's server record (`error_details`, `status`, `authentication_status`) |
+| missing and unused secrets | secret names in the app Worker's settings against the env names its deployed `app.js` reads. A generated API module reads its credentials by a name held in its config, so `sourceSecrets` in `src/sources.ts` answers for it |
+| expiring secrets | dates entered beside values (UI) or with `set_secret_expiry` (agents), kept per app in the inbox. A new value takes the date given with it, or none |
+| upstream works | the app's own `probe` export |
+
+runkle cannot call an app's tools: only the portal holds the app's token. So
+it asks the app to run its probe at `/manifest/probe` (under `/manifest`,
+which Access already lets through on an app with pages). The request carries
+a random key that runkle put in its inbox a moment before; the app's runtime
+checks and uses up that key through its `RUNKLE_INBOX` binding. The key
+lasts a minute and opens nothing but the probe.
+
+A Cron Trigger on runkle's Worker (`triggers.crons`, `scheduled` in
+`src/index.ts`) runs the check daily and opens one inbox `alert` per problem,
+with an id built from the integration, the kind of problem and the secret
+(`health:garmin:expiring:garmin-token`), so a standing problem stays one open
+item and notifies once. Alerts whose problem is gone are closed. The UI's
+**Check now** does the same. `check_integrations` only reports. A scheduled
+run has no request, so its notifications are signed with the address of the
+page that subscribed, kept with each subscription.
+
+Not covered: each person's own sign-in to the portal and to OAuth servers
+lives in the portal, which does not show it to the API. The report gives the
+portal's Access session duration instead. An app deployed before health
+checks answers 404 at `/manifest/probe` and is reported as not probed until
+it is updated once. HTTP API sources declare no probe.
+
 ## The parts that bite
 
 - **Portal PUT replaces the whole server mapping.** Omit a server and it is
@@ -186,6 +276,10 @@ Not covered:
 - **Admin sign-in for dynamically registered OAuth servers is dashboard-only.**
   The API has no way to start it, so the UI links to the dashboard for that
   one step. Servers with your own client need no admin sign-in.
+- **Creating a portal through the API makes no DNS record.** Without one the
+  hostname answers 522, so runkle copies the main portal's record. A
+  hostname two labels under the zone (`personal.mcp.example.com`) gets no
+  certificate from Universal SSL, hence `mcp-<id>.example.com`.
 - **CSRF.** Access authenticates by cookie, so mutations require a
   same-origin `Origin` header.
 - **Non-atomic add/remove.** Three Cloudflare calls; a failure midway is

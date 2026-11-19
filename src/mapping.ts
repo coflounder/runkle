@@ -177,3 +177,11 @@ export function appSecrets(value: unknown): Record<string, string> {
   }
   return value as Record<string, string>;
 }
+
+// When a secret stops working, as a calendar day (UTC). A date, never a value.
+export function expiryDate(value: unknown, name: string): string {
+  const day = typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? Date.parse(`${value}T00:00:00Z`) : NaN;
+  if (Number.isNaN(day) || new Date(day).toISOString().slice(0, 10) !== value)
+    throw new InputError(`The expiry date of ${name} must be a day written YYYY-MM-DD`);
+  return value as string;
+}

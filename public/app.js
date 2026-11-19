@@ -40,16 +40,30 @@ async function act(control, fn) {
 
 // ---- Secret fields: write-only, masked, wiped whenever their dialog closes ----
 
-function secretFields(container) {
+// With `onGenerate`, each row can instead have runkle generate its value, which
+// nobody types or sees; `onGenerate` is told whether any row does.
+function secretFields(container, onGenerate) {
   const rows = h("div", { className: "stack" });
   const add = h("button", { type: "button", textContent: "Add a secret" });
+  const generating = () => [...rows.children].filter((r) => r.querySelector("[data-generate]")?.checked);
   const addRow = (name = "") => {
     const remove = h("button", { type: "button", textContent: "Remove", ariaLabel: "Remove this secret" });
-    const row = h("div", { className: "secret" },
+    const value = h("input", { type: "password", placeholder: "value", ariaLabel: "Secret value", required: true, autocomplete: "new-password" });
+    const generate = onGenerate && h("input", { type: "checkbox", title: "runkle makes a random value; nobody sees it" });
+    if (generate) {
+      generate.dataset.generate = "";
+      generate.onchange = () => {
+        Object.assign(value, { disabled: generate.checked, value: "", placeholder: generate.checked ? "runkle makes it" : "value" });
+        onGenerate(generating().length > 0);
+      };
+    }
+    const row = h("div", { className: generate ? "secret generate" : "secret" },
       h("input", { type: "text", placeholder: "NAME", ariaLabel: "Secret name", pattern: "[A-Z][A-Z0-9_]*", required: true, autocomplete: "off", spellcheck: false }),
-      h("input", { type: "password", placeholder: "value", ariaLabel: "Secret value", required: true, autocomplete: "new-password" }),
+      value,
+      h("input", { type: "date", ariaLabel: "Expires on (optional)", title: "Expires on (optional): runkle warns you 14 days before" }),
+      generate ? h("label", { className: "check" }, generate, "Generate") : null,
       remove);
-    remove.onclick = () => row.remove();
+    remove.onclick = () => { row.remove(); onGenerate?.(generating().length > 0); };
     rows.append(row);
     row.children[0].value = name;
     row.children[name ? 1 : 0].focus();
@@ -57,8 +71,10 @@ function secretFields(container) {
   add.onclick = () => addRow();
   container.append(rows, h("div", {}, add));
   return {
-    values: () => Object.fromEntries([...rows.children].map((r) => [r.children[0].value, r.children[1].value])),
-    clear: () => rows.replaceChildren(),
+    values: () => Object.fromEntries([...rows.children].filter((r) => !generating().includes(r)).map((r) => [r.children[0].value, r.children[1].value])),
+    expires: () => Object.fromEntries([...rows.children].filter((r) => !generating().includes(r) && r.children[2].value).map((r) => [r.children[0].value, r.children[2].value])),
+    generated: () => generating().map((r) => r.children[0].value),
+    clear: () => { rows.replaceChildren(); onGenerate?.(false); },
     add: addRow,
   };
 }
@@ -181,6 +197,9 @@ async function setupNotify() {
 // ---- Integrations ----
 
 const STATUS = { ready: "Ready", waiting: "Waiting for sign-in", stale: "Needs sync", error: "Error" };
+// What the last health check found (src/health.ts), by integration id.
+const HEALTH = { ok: "Healthy", upstream_error: "Failing", needs_sign_in: "Needs sign-in", missing_secret: "Missing secret", expiring: "Secret expiring", unused_secret: "Unused secret" };
+let health = {};
 
 function integrationRow(i, open) {
   const status = (i.status || "waiting").toLowerCase().replace(/ .*/, "");
@@ -211,13 +230,18 @@ function integrationRow(i, open) {
     setTimeout(() => { delete remove.dataset.armed; remove.textContent = "Remove"; }, 4000);
   };
 
+  const checked = health[i.id];
+  const expiry = (name) => (i.secret_expiry?.[name] ? `${name} (expires ${i.secret_expiry[name]})` : name);
   return h("details", { className: "row", open, id: `i-${i.id}` },
     h("summary", {},
       h("span", { className: "grow wrap" }, h("strong", {}, i.name), h("br"), h("small", {}, i.is_app ? "Runs on runkle" : i.url)),
       h("small", {}, i.tools.length ? `${on} of ${i.tools.length} tools on` : ""),
+      checked ? h("span", { className: `badge ${checked.status === "ok" ? "ready" : checked.status === "unused_secret" ? "stale" : "error"}`, title: "At the last health check" }, HEALTH[checked.status]) : null,
       h("span", { className: `badge ${status}` }, STATUS[status] || i.status)),
     i.error ? h("p", { className: "error tools" }, i.error) : null,
-    i.secrets_set?.length ? h("p", { className: "muted tools" }, `Secrets set: ${i.secrets_set.join(", ")}`) : null,
+    ...(checked?.problems ?? []).map((p) => h("p", { className: "tools wrap" }, h("strong", {}, p.reason), " ", h("small", {}, p.fix))),
+    checked?.note ? h("p", { className: "muted tools" }, checked.note) : null,
+    i.secrets_set?.length ? h("p", { className: "muted tools" }, `Secrets set: ${i.secrets_set.map(expiry).join(", ")}`, i.secrets_copied?.length ? `. Copy in 1Password: ${i.secrets_copied.join(", ")}` : "") : null,
     i.ask_first?.length ? h("p", { className: "muted tools" }, `Asks you first: ${i.ask_first.join(", ")}. Requests wait in the inbox.`) : null,
     h("div", { className: "tools" }, ...tools),
     h("div", { className: "actions" }, review, sync, edit,
@@ -225,14 +249,68 @@ function integrationRow(i, open) {
       remove));
 }
 
+// One collection: its endpoint, which integrations it serves and which of their tools it blocks.
+function collectionRow(c, integrations, open) {
+  const members = new Map(c.integrations.map((m) => [m.id, m]));
+  const endpoint = h("input", { type: "text", readOnly: true, value: c.endpoint, id: `c-end-${c.id}`, ariaLabel: `${c.name} endpoint` });
+  const copy = h("button", { textContent: "Copy" });
+  copy.onclick = async () => { await navigator.clipboard.writeText(c.endpoint); copy.textContent = "Copied"; setTimeout(() => (copy.textContent = "Copy"), 1500); };
+  const rows = integrations.map((i) => {
+    const box = h("input", { type: "checkbox", checked: members.has(i.id), id: `c-${c.id}-${i.id}` });
+    box.onchange = () => act(box, () => api("PUT", `/api/collections/${c.id}`, box.checked ? { add: [i.id] } : { remove: [i.id] }));
+    const blocked = members.get(i.id)?.blocked_tools ?? [];
+    const tools = members.has(i.id) && i.tools.length
+      ? h("details", {}, h("summary", {}, h("small", {}, `${i.tools.length - blocked.length} of ${i.tools.length} tools on here`)),
+          ...i.tools.map((t) => {
+            const tool = h("input", { type: "checkbox", checked: !blocked.includes(t.name), id: `c-${c.id}-${i.id}-${t.name}` });
+            tool.onchange = () => act(tool, () => api("PUT", `/api/integrations/${i.id}/tools`, { tool: t.name, enabled: tool.checked, collection: c.id }));
+            return h("div", { className: "tool" }, tool, h("label", { htmlFor: tool.id }, h("code", {}, t.name)));
+          }))
+      : null;
+    return h("div", { className: "tool" }, box, h("label", { htmlFor: box.id }, i.name), tools);
+  });
+  const mode = h("select", {}, ...["off", "opt_in", "default_on", "enforced"].map((v) => h("option", { value: v, textContent: $("code-mode").querySelector(`[value=${v}]`).textContent })));
+  mode.value = c.code_mode || "opt_in";
+  mode.onchange = () => act(mode, () => api("PUT", "/api/portal", { code_mode: mode.value, collection: c.id }));
+  const remove = h("button", { className: "danger", textContent: "Delete collection" });
+  remove.onclick = () => {
+    if (remove.dataset.armed) return act(remove, () => api("DELETE", `/api/collections/${c.id}`));
+    remove.dataset.armed = "1";
+    remove.textContent = "Really delete? Agents connected to it lose access";
+    setTimeout(() => { delete remove.dataset.armed; remove.textContent = "Delete collection"; }, 4000);
+  };
+  return h("details", { className: "row", open, id: `c-${c.id}` },
+    h("summary", {}, h("span", { className: "grow wrap" }, h("strong", {}, c.name), h("br"), h("small", {}, c.endpoint)), h("small", {}, `${c.integrations.length} integrations`)),
+    h("div", { className: "copy tools" }, endpoint, copy),
+    h("pre", { className: "tools" }, `claude mcp add --transport http runkle-${c.id} ${c.endpoint}`),
+    h("div", { className: "tools" }, ...rows),
+    h("label", { className: "tools" }, "Code mode", mode),
+    h("div", { className: "actions" }, remove));
+}
+
+$("new-collection").onsubmit = (e) => {
+  e.preventDefault();
+  const f = e.target;
+  act(e.submitter, async () => {
+    const made = await api("POST", "/api/collections", { name: new FormData(f).get("name") });
+    f.reset();
+    $("notice").textContent = `Created ${made.endpoint}. Tick the integrations it serves, then add it to your agent as a new connector and sign in.`;
+    $("notice").hidden = false;
+  });
+};
+
 async function load() {
-  const [s] = await Promise.all([api("GET", "/api/state"), loadInbox()]);
+  const [s, , report] = await Promise.all([api("GET", "/api/state"), loadInbox(), api("GET", "/api/health")]);
   state = s;
+  showHealth(report);
   const open = new Set([...document.querySelectorAll("#integrations details[open]")].map((d) => d.id));
   $("me").textContent = `${s.portal.name} · ${s.me}`;
   $("integrations").replaceChildren(...(s.integrations.length
     ? s.integrations.map((i) => integrationRow(i, open.has(`i-${i.id}`)))
     : [h("p", { className: "row muted" }, "Nothing connected yet. Add a remote MCP server or upload a script, and its tools show up here.")]));
+  const openCollections = new Set([...document.querySelectorAll("#collections details.row[open]")].map((d) => d.id));
+  $("collections").replaceChildren(...s.collections.map((c) => collectionRow(c, s.integrations, openCollections.has(`c-${c.id}`))));
+  $("collections").hidden = !s.collections.length;
   $("endpoint").value = s.endpoint;
   $("admin-endpoint").value = `${location.origin}/mcp`;
   $("snippet").textContent = `# Claude Code\nclaude mcp add --transport http runkle ${s.endpoint}\n\n# Anything else: add a remote (streamable HTTP) MCP server with this URL`;
@@ -255,6 +333,18 @@ for (const button of document.querySelectorAll("[data-copy]"))
     button.textContent = "Copied";
     setTimeout(() => (button.textContent = "Copy"), 1500);
   };
+function showHealth(report) {
+  health = Object.fromEntries((report?.integrations ?? []).map((i) => [i.id, i]));
+  $("checked").textContent = report?.checked_at ? `Last checked ${new Date(report.checked_at).toLocaleString()}. ${report.sign_in}` : "";
+}
+// Runs the same check as the daily one; problems also land in the inbox as alerts.
+$("check").onclick = () =>
+  act($("check"), async () => {
+    const report = await api("POST", "/api/health");
+    const problems = report.integrations.reduce((n, i) => n + i.problems.length, 0);
+    $("notice").textContent = problems ? `${problems} problem${problems === 1 ? "" : "s"} found. Each is in your inbox and beside its integration.` : `All ${report.integrations.length} integrations look healthy.`;
+    $("notice").hidden = false;
+  });
 $("code-mode").onchange = (e) => act(e.target, () => api("PUT", "/api/portal", { code_mode: e.target.value }));
 
 $("agent-auth").onsubmit = (e) => {
@@ -286,7 +376,7 @@ $("add").onclick = () => { $("notice").hidden = true; showFields(); $("dialog").
 form.onsubmit = async (e) => {
   const made = await submit(e, $("form-error"), closeNew, async () => {
     const name = form.elements.name.value;
-    if (form.kind.value === "app") return api("POST", "/api/apps", { name, source: await form.file.files[0].text(), secrets: newSecrets.values() });
+    if (form.kind.value === "app") return api("POST", "/api/apps", { name, source: await form.file.files[0].text(), secrets: newSecrets.values(), expires: newSecrets.expires() });
     if (form.kind.value === "skills")
       return api("POST", "/api/skills", { name, skills: await Promise.all([...form.skill_files.files].map((f) => f.text())) });
     if (form.kind.value === "api")
@@ -312,23 +402,33 @@ form.onsubmit = async (e) => {
 // ---- Update an uploaded script ----
 
 const appForm = $("app-form");
-const appSecrets = secretFields(appForm.querySelector("[data-secrets]"));
+const appSecrets = secretFields(appForm.querySelector("[data-secrets]"), (any) => ($("keep").hidden = !any));
 function openApp(i) {
   appForm.dataset.id = i.id;
   appForm.ask_first.value = appForm.dataset.ask = (i.ask_first || []).join("\n");
   $("h-app").textContent = `Update ${i.name}`;
+  $("app-secrets").textContent = i.secrets_set?.length
+    ? `Set: ${i.secrets_set.join(", ")}.${i.secrets_copied?.length ? ` Copy in 1Password: ${i.secrets_copied.join(", ")}.` : ""}`
+    : "No secrets set yet.";
+  // Apps that can be handed a copy hold secrets of their own, so their code is reviewed.
+  const vaults = state.integrations.filter((x) => x.is_app && x.secrets_set?.length);
+  appForm.keep_app.replaceChildren(h("option", { value: "", textContent: "Don't keep a copy" }), ...vaults.map((x) => h("option", { value: x.id, textContent: x.name })));
+  appForm.keep_app.value = vaults.find((x) => /1-?password|onepassword/.test(x.id))?.id ?? "";
   $("app-dialog").showModal();
 }
 const closeApp = secretDialog($("app-dialog"), appForm, $("app-error"), appSecrets);
 appForm.onsubmit = (e) =>
   submit(e, $("app-error"), closeApp, async () => {
+    const id = appForm.dataset.id;
     const file = appForm.file.files[0];
     const ask = appForm.ask_first.value.trim();
-    return api("PUT", `/api/apps/${appForm.dataset.id}`, {
-      ...(file && { source: await file.text() }),
-      secrets: appSecrets.values(),
-      ...(ask !== appForm.dataset.ask && { ask_first: ask ? ask.split(/\s+/) : [] }),
-    });
+    const typed = appSecrets.values(), generated = appSecrets.generated();
+    const change = { ...(file && { source: await file.text() }), ...(ask !== appForm.dataset.ask && { ask_first: ask ? ask.split(/\s+/) : [] }) };
+    const made = Object.keys(change).length || Object.keys(typed).length || !generated.length ? await api("PUT", `/api/apps/${id}`, { ...change, secrets: typed, expires: appSecrets.expires() }) : undefined;
+    // One value per name, each in a field of that name.
+    const keep = appForm.keep_app.value && { app: appForm.keep_app.value, vault: appForm.keep_vault.value, item: appForm.keep_item.value };
+    for (const name of generated) await api("POST", "/api/generate", { targets: [{ app: id, secret: name }], ...(keep && { copy_to: { ...keep, field: name } }) });
+    return made;
   }).then((made) => made?.id && showDeployed(made));
 
 // ---- Review a change an agent proposed to a script that holds secrets ----

@@ -32,6 +32,7 @@ database: Cloudflare's API is the store. Read `docs/architecture.md` first.
 - `src/ops.ts`: every operation, shared by the UI's API and the MCP tools.
 - `src/apps.ts`, `src/app-runtime.ts`: apps (scripts, API sources, skill packs) and the entry module deployed with each.
 - `src/sources.ts`: generates an app module from an OpenAPI or Discovery document, a GraphQL endpoint, or skills.
+- `src/generate.ts`: what `generate_secret` may ask for and the random value; the operation is `generateSecret` in `src/ops.ts`.
 - `src/index.ts`: Access auth and HTTP routes. `src/mcp.ts`: the same operations as MCP tools.
 - `public/`: the whole UI, no build step. The CSP in `_headers` forbids inline script and style.
 - `scripts/`: ready-made scripts people upload. They are ordinary scripts with no special access.

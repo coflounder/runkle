@@ -27,6 +27,7 @@ export const schedules = { nightly: { cron: "0 6 * * *", async run(env, ctx) {} 
 export const webhooks = { name: async (request, env, ctx) => "ok" }; // public: verify the sender's signature
 export const pages = { name: async (request, env, ctx) => "<h1>HTML</h1>" }; // behind Cloudflare Access
 export const workflows = { name: async (step, input, env, ctx) => step.do("first", async () => 1) }; // Cloudflare Workflows steps
+export const probe = async (env, ctx) => {}; // a cheap read that throws when the script's secrets or upstream do not work; run by check_integrations and runkle's daily check
 
 env holds the script's secrets. ctx.storage has get(key), put(key, value), delete(key) and list(prefix), all async and durable.
 ctx.workflows has start(name, input), which returns an id, and status(id).
@@ -46,7 +47,7 @@ function createServer(env: Env, ui: string) {
   const server = new McpServer(
     { name: "runkle", version: "1.0.0" },
     {
-      instructions: `Manage the integrations served by this runkle portal. Never ask the user for a password, token or API key and never put one in a script: declare what the script reads from \`env\`, then give the user the link from request_credentials so they can enter the values themselves. For an MCP server that needs an access token or its own OAuth client, give them the link from request_mcp_server_setup.\n\n${USING_THE_PORTAL}\n\n${SCRIPT_FORMAT}`,
+      instructions: `Manage the integrations served by this runkle portal. Never ask the user for a password, token or API key and never put one in a script: declare what the script reads from \`env\`, then use generate_secret when the value is one you could make up (a shared token, a signing key), or give the user the link from request_credentials so they can enter values only they have. For an MCP server that needs an access token or its own OAuth client, give them the link from request_mcp_server_setup.\n\n${USING_THE_PORTAL}\n\n${SCRIPT_FORMAT}`,
     },
   );
 
@@ -62,11 +63,35 @@ function createServer(env: Env, ui: string) {
   };
   const added = (fn: () => Promise<object>) => run(async () => ({ ...(await fn()), next_steps: NEXT_STEPS }));
   const id = z.string().describe("Integration id from list_integrations");
+  const collection = z.string().describe("Collection id from list_integrations");
+  const inCollection = collection.optional().describe("A collection id from list_integrations, to change only that collection. Without it, the change is to the portal that serves every integration.");
 
   server.registerTool(
     "list_integrations",
-    { description: "List every integration with its status and tools, plus the portal endpoint and agent sign-in settings.", annotations: { readOnlyHint: true } },
+    {
+      description:
+        "List every integration with its status and tools, plus the portal endpoint, the collections (each a separate endpoint serving some of the integrations, with the tools it blocks) and agent sign-in settings.",
+      annotations: { readOnlyHint: true },
+    },
     () => run(() => ops.state(env, "agent")),
+  );
+  server.registerTool(
+    "check_integrations",
+    {
+      description:
+        "Check whether each integration works before you rely on it. Per integration: status ok, upstream_error, needs_sign_in, missing_secret, expiring (a secret expires within 14 days or has expired) or unused_secret, and each problem with a one-line reason and what to do. Apps are asked to run their own probe if their script exports one. Each person's own sign-ins are not visible to runkle. Changes nothing.",
+      annotations: { readOnlyHint: true },
+    },
+    () => run(() => ops.checkIntegrations(env)),
+  );
+  server.registerTool(
+    "set_secret_expiry",
+    {
+      description: "Record the day a script's or API's secret stops working, so runkle warns the user 14 days before. A date only, never a value; entering a new value for the secret clears it. list_integrations shows the dates as secret_expiry.",
+      inputSchema: { id, name: z.string().describe("Secret name as in secrets_set"), expires: z.string().nullable().describe("YYYY-MM-DD, or null to forget the date") },
+      annotations: { idempotentHint: true },
+    },
+    ({ id, ...input }) => run(() => ops.setExpiry(env, id, input)),
   );
   server.registerTool(
     "add_mcp_server",
@@ -154,6 +179,25 @@ function createServer(env: Env, ui: string) {
     (input) => run(() => ops.credentialLink(env, ui, input)),
   );
   server.registerTool(
+    "generate_secret",
+    {
+      description:
+        "Make a new random credential and set it where it is used, without anyone seeing or pasting it: as secrets on scripts or HTTP APIs, and/or as the bearer token the portal sends to a remote MCP server. Optionally keep a copy in 1Password through a 1Password integration (scripts/onepassword.js), so the user can give the same value to the other side. The value is never returned. The first call waits until the user approves in their runkle inbox and returns a link; call again with exactly the same arguments to run it, once.",
+      inputSchema: {
+        targets: z
+          .array(z.union([z.object({ app: id, secret: z.string().describe("Secret name, UPPER_SNAKE_CASE") }), z.object({ server: id.describe("A remote MCP server that signs in with a bearer token") })]))
+          .describe("Where the same value goes, 1 to 10 places"),
+        length: z.number().int().optional().describe("16 to 128 characters, default 40"),
+        alphabet: z.enum(["alphanumeric", "hex", "base64url"]).optional().describe("Default alphanumeric"),
+        copy_to: z
+          .object({ app: id.describe("The integration that keeps copies, e.g. 1Password"), vault: z.string(), item: z.string().describe("Item title; created if missing"), field: z.string().describe("Field label; replaced if present, the old value stays in the item's history") })
+          .optional(),
+      },
+      annotations: { destructiveHint: true },
+    },
+    (input) => run(() => ops.generateSecret(env, ui, input)),
+  );
+  server.registerTool(
     "request_mcp_server_setup",
     {
       description: "Get a link where the user finishes adding an MCP server that needs an access token (auth bearer) or their own OAuth client (auth oauth_manual). Hand the link to the user.",
@@ -174,7 +218,7 @@ function createServer(env: Env, ui: string) {
   );
   server.registerTool(
     "set_tool_enabled",
-    { description: "Allow or block one tool of an integration for agents using the portal.", inputSchema: { id, tool: z.string(), enabled: z.boolean() } },
+    { description: "Allow or block one tool of an integration for agents using the portal, or one collection.", inputSchema: { id, tool: z.string(), enabled: z.boolean(), collection: inCollection } },
     ({ id, ...input }) => run(() => ops.toggleTool(env, id, input)),
   );
   server.registerTool(
@@ -187,8 +231,35 @@ function createServer(env: Env, ui: string) {
   );
   server.registerTool(
     "set_code_mode",
-    { description: "Set the portal's code mode policy.", inputSchema: { code_mode: z.enum(["off", "opt_in", "default_on", "enforced"]) } },
+    { description: "Set the code mode policy of the portal, or of one collection.", inputSchema: { code_mode: z.enum(["off", "opt_in", "default_on", "enforced"]), collection: inCollection } },
     (input) => run(() => ops.setCodeMode(env, input)),
+  );
+  server.registerTool(
+    "create_collection",
+    {
+      description:
+        "Make a collection: its own MCP endpoint that serves only the integrations you name, such as Personal or Work, so an agent connected to it sees nothing else. runkle sets up the hostname, its DNS record and its sign-in. Integrations join with the tool settings they have in the main portal. Every integration stays in the main portal too.",
+      inputSchema: { name: z.string().describe("e.g. Personal"), integrations: z.array(id).optional() },
+    },
+    (input) => run(() => ops.createCollection(env, input)),
+  );
+  server.registerTool(
+    "set_collection_integrations",
+    {
+      description: "Add integrations to a collection or take them out. Added ones join with the tool settings they have in the main portal. Agents connected to the collection see the change in a fresh session.",
+      inputSchema: { collection, add: z.array(id).optional(), remove: z.array(id).optional() },
+      annotations: { idempotentHint: true },
+    },
+    ({ collection, ...input }) => run(() => ops.setCollection(env, collection, input)),
+  );
+  server.registerTool(
+    "delete_collection",
+    {
+      description: "Delete a collection's endpoint, with its DNS record and sign-in. Its integrations keep working in the main portal and any other collection. Agents connected to it lose access.",
+      inputSchema: { collection },
+      annotations: { destructiveHint: true },
+    },
+    ({ collection }) => run(() => ops.deleteCollection(env, collection)),
   );
 
   return server;

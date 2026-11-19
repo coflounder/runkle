@@ -134,11 +134,55 @@ export async function updateApp(env: Env, server: { id: string; hostname?: strin
     return finish(env, server.id, host, manifest, deps);
   }
   if (!Object.keys(secrets).length) throw new InputError("Nothing to update");
-  for (const [name, text] of Object.entries(secrets))
-    await cf(env, "PUT", `${scriptPath(server.id)}/secrets`, { name, text, type: "secret_text" }).catch((error) => {
-      // Cloudflare refuses secret edits while the newest version is not the deployed one.
-      throw /isn't currently deployed/.test(error.message) ? new InputError("A script change is waiting for review. Approve or reject it first.") : error;
-    });
+  // A value typed by a person replaces whatever a vault held a copy of.
+  const { copied } = await appConfig(env, server.id);
+  for (const [name, text] of Object.entries(secrets)) {
+    await setSecret(env, server.id, name, text);
+    if (copied.includes(name)) await deleteSecret(env, server.id, copyMark(name));
+  }
+}
+
+const REVIEW_PENDING = "A script change is waiting for review. Approve or reject it first.";
+
+export const setSecret = (env: Env, id: string, name: string, text: string) =>
+  cf(env, "PUT", `${scriptPath(id)}/secrets`, { name, text, type: "secret_text" }).catch((error) => {
+    // Cloudflare refuses secret edits while the newest version is not the deployed one.
+    throw /isn't currently deployed/.test(error.message) ? new InputError(REVIEW_PENDING) : error;
+  });
+export const deleteSecret = (env: Env, id: string, name: string) => cf(env, "DELETE", `${scriptPath(id)}/secrets/${name}`);
+
+// A secret whose value runkle generated and also handed to a vault app is
+// marked by a second secret binding, RUNKLE_COPY_<name>. Its value says nothing;
+// its name is how the UI and agents learn that a copy exists.
+export const copyMark = (name: string) => `RUNKLE_COPY_${name}`;
+
+// Hands a value runkle generated to an app that keeps copies (one exporting
+// `vault`, such as scripts/onepassword.js). The app's code gets it as the
+// argument of one call, never in its env. The call carries a key made for it
+// and set as the app's RUNKLE_SETUP, so runkle stores nothing and only runkle
+// can make it; the next call replaces the key.
+export async function keepCopy(env: Env, server: Server, copy: { vault: string; item: string; field: string }, value: string) {
+  if (!server || !isApp(server)) throw new InputError("copy_to.app is not a script");
+  const key = randomKey();
+  await setSecret(env, server.id, "RUNKLE_SETUP", key);
+  const host = new URL(server.hostname!).host;
+  // A new secret takes a few seconds to reach every Cloudflare location; until then the old key answers 401.
+  for (let attempt = 1; ; attempt++) {
+    const res = await appFetch(env, host, "/vault", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ...copy, value }),
+      redirect: "manual",
+    }).catch(() => null);
+    if (res?.ok) return;
+    if (res && res.status !== 401) {
+      const why = res.status === 404 ? `${server.id} cannot keep copies: its script exports no vault` : ((await res.json().catch(() => null)) as any)?.error || `HTTP ${res.status}`;
+      // The app's error may quote what it was sent; never pass the value on.
+      throw new UpstreamError(`Keeping a copy failed: ${String(why).replaceAll(value, "[the generated value]")}`);
+    }
+    if (attempt === 5) throw new UpstreamError(`Keeping a copy failed: ${server.id} is not answering${res ? ` (HTTP ${res.status})` : ""}`);
+    await sleep(2000);
+  }
 }
 
 // ---- Review: an agent's change to a script that holds secrets ----
@@ -163,6 +207,9 @@ async function sourceOf(env: Env, id: string, version: string): Promise<string> 
   const bytes = Uint8Array.from(atob(modules.find((m: any) => m.name === "app.js").content_base64), (c) => c.charCodeAt(0));
   return new TextDecoder().decode(bytes);
 }
+
+// The code serving now, not a proposal waiting for review.
+export const deployedSource = async (env: Env, id: string) => sourceOf(env, id, (await versions(env, id)).deployed);
 
 type Server = { id: string; hostname?: string } | undefined;
 
@@ -203,12 +250,15 @@ export async function decide(env: Env, server: Server, input: any, deps: Deps, b
   return result;
 }
 
-// What a person has set on an app: its secrets by name (Cloudflare never gives
-// a value back) and the tools they want to be asked about.
-export async function appConfig(env: Env, id: string): Promise<{ secrets: string[]; ask_first: string[] }> {
+// What is set on an app: its secrets by name (Cloudflare never gives
+// a value back), which of them a vault keeps a copy of, and the tools they want to be asked about.
+export async function appConfig(env: Env, id: string): Promise<{ secrets: string[]; copied: string[]; ask_first: string[] }> {
   const { bindings } = await cf<{ bindings: { name: string; type: string; text?: string }[] }>(env, "GET", `${scriptPath(id)}/settings`);
+  const secrets = bindings.filter((b) => b.type === "secret_text" && !b.name.startsWith("RUNKLE_")).map((b) => b.name);
+  const names = new Set(bindings.map((b) => b.name));
   return {
-    secrets: bindings.filter((b) => b.type === "secret_text" && !b.name.startsWith("RUNKLE_")).map((b) => b.name),
+    secrets,
+    copied: secrets.filter((name) => names.has(copyMark(name))),
     ask_first: JSON.parse(bindings.find((b) => b.name === "RUNKLE_ASK")?.text ?? "[]"),
   };
 }
