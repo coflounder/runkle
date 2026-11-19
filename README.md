@@ -367,6 +367,18 @@ A Connect token is limited to the vaults you pick, like a service account.
    and `OP_CONNECT_TOKEN`, plus `CF_ACCESS_CLIENT_ID` and
    `CF_ACCESS_CLIENT_SECRET` if it is behind Access.
 
+`scripts/fastmail.js` gives agents your Fastmail mail, contacts and calendar.
+It stands in front of Fastmail's own MCP server, so the tools are Fastmail's:
+the script's `tools` lists them and `call` runs one. Searching, reading,
+listing and drafting an email run at once. Everything else asks first:
+sending, deleting, moving mail, and creating or changing events and contacts.
+A tool Fastmail adds later also asks first, until you add it to `FREE` at the
+top of the script. Upload it with the secret `FASTMAIL_TOKEN`, an API token of
+type MCP from Fastmail's Settings > Privacy & Security > Manage API tokens.
+
+Adding Fastmail's MCP server to the portal directly also works, but then
+nothing asks first: the portal calls it without passing through runkle.
+
 `scripts/github.js` gives agents repositories, pull requests, merges, tags and
 workflow runs without a GitHub token of their own. It acts as a GitHub App,
 so it reaches only the repositories you install the App on. Reading and

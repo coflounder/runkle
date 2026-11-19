@@ -1221,3 +1221,39 @@ test("GitHub: acts as an App, and merges to main, tags, workflow runs and new re
   assert.equal(calls.filter((c) => c.path === "/orgs/acme/repos").at(-1)!.body.private, true);
   assert.equal(wrote().length, before + 3, "each ran once, and only after approval");
 });
+
+test("Fastmail: reading and drafting pass straight through, sending and changing ask first", async (t) => {
+  const fake = fakeCloudflare();
+  const ran: any[] = [];
+  const offered = ["search_email", "read_email", "draft_email", "send_email", "delete_email", "update_event", "delete_contact", "list_calendars", "brand_new_tool"];
+  t.mock.method(globalThis, "fetch", async (input: any, init: any) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.fastmail.com/mcp") return fake.handle(request);
+    if (request.headers.get("Authorization") !== "Bearer fm-token") return new Response("no", { status: 401 });
+    const msg: any = await request.json();
+    if (msg.method === "initialize") return Response.json({ jsonrpc: "2.0", id: msg.id, result: {} }, { headers: { "Mcp-Session-Id": "s1" } });
+    assert.equal(request.headers.get("Mcp-Session-Id"), "s1");
+    if (msg.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (msg.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: msg.id, result: { tools: offered.map((name) => ({ name, description: name.replace("_", " "), inputSchema: { type: "object" } })) } });
+    ran.push(msg.params);
+    const result = msg.params.name === "delete_email" ? { isError: true, content: [{ type: "text", text: "No such email" }] } : { content: [{ type: "text", text: "did " + msg.params.name }] };
+    // Fastmail may answer as an event stream.
+    return new Response(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result })}\n\n`, { headers: { "Content-Type": "text/event-stream" } });
+  });
+  const { made, tool, approved } = await readyMade(fake, "fastmail.js", "Fastmail", { FASTMAIL_TOKEN: "fm-token" });
+  assert.deepEqual(made.approvals, ["call"]);
+
+  const listed = await tool("tools");
+  assert.deepEqual(listed.filter((x: any) => !x.asks_first).map((x: any) => x.name), ["search_email", "read_email", "draft_email", "list_calendars"], "a tool Fastmail adds later asks first until someone decides otherwise");
+  assert.equal(await tool("call", { tool: "search_email", arguments: { query: "invoice" } }), "did search_email");
+  assert.equal(await tool("call", { tool: "draft_email", arguments: { to: ["a@example.com"], subject: "Hi" } }), "did draft_email");
+
+  const send = { tool: "send_email", arguments: { to: [{ email: "a@example.com" }], subject: "Hi   there", body: "x".repeat(500) } };
+  assert.ok((await tool("call", send)).waiting_for_approval);
+  assert.equal(ran.length, 2, "nothing was sent");
+  assert.equal(await approved("call", send, /Fastmail: send_email\. to: a@example\.com; subject: Hi there; body: x{80}\n/), "did send_email");
+  assert.deepEqual(ran.at(-1), { name: "send_email", arguments: send.arguments });
+  for (const name of ["update_event", "delete_contact", "brand_new_tool"]) assert.ok((await tool("call", { tool: name, arguments: { id: "1" } })).waiting_for_approval, name);
+  assert.match((await approved("call", { tool: "delete_email", arguments: { emailId: "m1" } }, /delete_email\. emailId: m1/)).error, /No such email/);
+  assert.equal(ran.length, 4);
+});
