@@ -6,6 +6,7 @@ export type Env = {
   ACCESS_AUD: string;
   AUTH_DISABLED?: string; // "true" in .dev.vars only: skips Access for local development
   CF_API_BASE?: string; // override for tests and non-default API regions
+  INBOX: DurableObjectNamespace; // what waits for a person (src/inbox.ts)
 };
 
 export class UpstreamError extends Error {}

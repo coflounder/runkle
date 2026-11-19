@@ -6,6 +6,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Inbox } from "../src/inbox.ts";
 
 // Uploaded apps import their base classes from the Workers runtime; give Node a stand-in.
 const WORKERS = "data:text/javascript,class Base { constructor(ctx, env) { this.ctx = ctx; this.env = env; } } export { Base as DurableObject, Base as WorkflowEntrypoint };";
@@ -13,7 +14,10 @@ registerHooks({
   resolve: (specifier, context, next) => (specifier === "cloudflare:workers" ? { url: WORKERS, shortCircuit: true } : next(specifier, context)),
 });
 
-type Script = { versions: Record<string, string>[]; deployed: number; flags: string[]; modules: Record<string, string>; secrets: Record<string, string>; data: Map<string, unknown>; schedules: { cron: string }[]; mod?: any };
+type Script = { versions: Record<string, string>[]; deployed: number; flags: string[]; modules: Record<string, string>; secrets: Record<string, string>; vars: Record<string, string>; messages: string[]; data: Map<string, unknown>; schedules: { cron: string }[]; mod?: any };
+
+// The newest fake's inbox, which the tests hand runkle as its INBOX binding.
+export let latest: { inbox: DurableObjectNamespace } | undefined;
 
 export function fakeCloudflare() {
   const servers = new Map<string, any>();
@@ -21,6 +25,19 @@ export function fakeCloudflare() {
   const scripts = new Map<string, Script>();
   const workflows = new Map<string, any>();
   const runs: unknown[] = [];
+  const pushes: { endpoint: string; ttl: string | null; vapid: string | null; bytes: number }[] = []; // what push services received
+
+  // runkle's own inbox Durable Object, shared by runkle and every app as on Cloudflare.
+  const inboxData = new Map<string, unknown>();
+  const inboxObject = new Inbox({
+    storage: {
+      get: async (k: string) => structuredClone(inboxData.get(k)),
+      put: async (k: string, v: unknown) => void inboxData.set(k, structuredClone(v)),
+      delete: async (k: string) => inboxData.delete(k),
+      list: async ({ prefix = "" } = {}) => new Map([...inboxData].filter(([k]) => k.startsWith(prefix)).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => [k, structuredClone(v)])),
+    },
+  });
+  const inbox = { idFromName: (n: string) => n, get: () => ({ fetch: (url: string, init: RequestInit) => inboxObject.fetch(new Request(url, init)) }) } as unknown as DurableObjectNamespace;
 
   // Run an uploaded app the way Workers would: its modules, its secrets, a
   // Durable Object for storage and a workflow binding that runs steps inline.
@@ -33,14 +50,16 @@ export function fakeCloudflare() {
       script.mod = await import(join(dir, "index.js"));
     }
     const { mod, data } = script;
-    const storage = {
-      get: async (k: string) => data.get(k),
-      put: async (k: string, v: unknown) => void data.set(k, v),
-      delete: async (k: string) => data.delete(k),
-      list: async ({ prefix = "" } = {}) => new Map([...data].filter(([k]) => k.startsWith(prefix))),
-    };
-    const env: any = { ...script.secrets };
-    env.RUNKLE_STORE = { idFromName: (n: string) => n, get: () => new mod.Store({ storage }, env) };
+    // One Durable Object per name, each with its own keys.
+    const storage = (object: string) => ({
+      get: async (k: string) => data.get(object + k),
+      put: async (k: string, v: unknown) => void data.set(object + k, v),
+      delete: async (k: string) => data.delete(object + k),
+      list: async ({ prefix = "" } = {}) => new Map([...data].filter(([k]) => k.startsWith(object + prefix)).map(([k, v]) => [k.slice(object.length), v])),
+    });
+    const env: any = { ...script.secrets, ...script.vars };
+    env.RUNKLE_INBOX = inbox;
+    env.RUNKLE_STORE = { idFromName: (n: string) => n + "/", get: (object: string) => new mod.Store({ storage: storage(object) }, env) };
     env.RUNKLE_FLOW = {
       create: async ({ params }: any) => ({ id: String(runs.push(await new mod.Flow({}, env).run({ payload: params }, { do: (_: string, fn: () => unknown) => fn() })) - 1) }),
       get: async (id: string) => ({ status: async () => ({ status: "complete", output: runs[Number(id)] }) }),
@@ -67,6 +86,12 @@ export function fakeCloudflare() {
   async function handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
     // A request to an app's own hostname, direct or through CF_API_BASE (see appFetch).
+    // A browser's push service. The one at gone.push.test says its subscription has ended.
+    if (url.hostname.endsWith("push.test"))
+      return (
+        pushes.push({ endpoint: request.url, ttl: request.headers.get("TTL"), vapid: request.headers.get("Authorization"), bytes: (await request.arrayBuffer()).byteLength }),
+        new Response(null, { status: url.hostname === "gone.push.test" ? 410 : 201 })
+      );
     const [, host, rest] = url.pathname.match(/^\/__app\/([^/]+)(\/.*)$/) ?? (url.hostname.endsWith(".workers.dev") ? [, url.host, url.pathname] : []);
     if (host) {
       const { worker, env } = await app(host.split(".")[0]);
@@ -88,6 +113,8 @@ export function fakeCloudflare() {
     if (script && form) {
       const meta = JSON.parse(await (form.get("metadata") as File).text());
       const kept = meta.keep_bindings?.includes("secret_text") ? scripts.get(script)?.secrets : {};
+      const keptVars = meta.keep_bindings?.includes("plain_text") ? scripts.get(script)?.vars : {};
+      const vars = Object.fromEntries(meta.bindings.filter((b: any) => b.type === "plain_text").map((b: any) => [b.name, b.text]));
       const modules: Record<string, string> = {};
       for (const [name, part] of form) if (name !== "metadata") modules[name] = await (part as File).text();
       if (!modules["app.js"].includes("export")) return fail(400, "Uncaught SyntaxError: no exports");
@@ -96,7 +123,8 @@ export function fakeCloudflare() {
       const versions = [...(old?.versions ?? []), modules];
       // A version upload is stored but not deployed: the old code keeps serving.
       if (path.endsWith("/versions")) return (old!.versions = versions), ok({ id: `v${versions.length - 1}` });
-      scripts.set(script, { versions, deployed: versions.length - 1, flags: meta.compatibility_flags ?? [], modules, secrets: { ...kept, ...secrets }, data: old?.data ?? new Map(), schedules: old?.schedules ?? [] });
+      const messages = [...(old?.messages ?? []), meta.annotations?.["workers/message"] ?? ""];
+      scripts.set(script, { versions, deployed: versions.length - 1, flags: meta.compatibility_flags ?? [], modules, secrets: { ...kept, ...secrets }, vars: { ...keptVars, ...vars }, messages, data: old?.data ?? new Map(), schedules: old?.schedules ?? [] });
       return ok({ id: script });
     }
     if (script && key.endsWith("/versions")) return ok({ items: scripts.get(script)!.versions.map((_, n) => ({ id: `v${n}` })).reverse() });
@@ -104,7 +132,10 @@ export function fakeCloudflare() {
     if (script && key.endsWith("/secrets") && request.method === "PUT" && scripts.get(script)!.deployed !== scripts.get(script)!.versions.length - 1)
       return fail(400, "Secret edit failed. The latest version of your Worker isn't currently deployed.");
     if (script && key.endsWith("/subdomain")) return ok({ enabled: true });
-    if (script && key === `GET /workers/scripts/${script}/secrets`) return ok(Object.keys(scripts.get(script)!.secrets).map((name) => ({ name, type: "secret_text" })));
+    if (script && key === `GET /workers/scripts/${script}/settings`) {
+      const { secrets, vars } = scripts.get(script)!;
+      return ok({ bindings: [...Object.keys(secrets).map((name) => ({ name, type: "secret_text" })), ...Object.entries(vars).map(([name, text]) => ({ name, type: "plain_text", text }))] });
+    }
     if (script && key.endsWith("/secrets")) return (scripts.get(script)!.secrets[body.name] = body.text), ok({ name: body.name });
     if (script && key.endsWith("/schedules")) return (scripts.get(script)!.schedules = body), ok({ schedules: body });
     if (script && request.method === "DELETE") return scripts.delete(script), ok(null);
@@ -153,7 +184,8 @@ export function fakeCloudflare() {
     return fail(404, `no fake route for ${key}`);
   }
 
-  return { handle, servers, apps, portal, scripts, credentials, workflows, app };
+  latest = { inbox };
+  return { handle, servers, apps, portal, scripts, credentials, workflows, app, pushes, inbox, inboxData };
 }
 
 if (import.meta.main) {

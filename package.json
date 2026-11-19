@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@block65/webcrypto-web-push": "^2.0.0",
     "@modelcontextprotocol/server": "^2.4.0",
     "agents": "^0.33.0",
     "jose": "^6.2.17",

@@ -12,6 +12,11 @@
 //   pages      HTTP handlers at /pages/<name>, only behind Cloudflare Access
 //   workflows  durable multi-step functions, run by Cloudflare Workflows
 //
+// A tool that needs a person's approval (named in RUNKLE_ASK, or carrying an
+// `approval` of its own) does not run when called. The call goes to runkle's
+// inbox and the agent gets a link to it; the same call runs once after a person
+// approves it there.
+//
 // Handlers get the app's own secrets plus { storage, workflows }, and never
 // runkle's own bindings (everything named RUNKLE_*).
 //
@@ -46,6 +51,51 @@ export class Store extends DurableObject {
   put(key, value) { return this.ctx.storage.put(key, value); }
   delete(key) { return this.ctx.storage.delete(key); }
   async list(prefix) { return Object.fromEntries(await this.ctx.storage.list(prefix ? { prefix } : {})); }
+}
+
+// ---- Approvals ----
+
+// Tools the person running runkle wants to be asked about, by name; * matches anything.
+function listed(env, name) {
+  let asks = [];
+  try { asks = JSON.parse(env.RUNKLE_ASK || "[]"); } catch {}
+  return asks.some((p) => new RegExp("^" + p.split("*").map((s) => s.replace(/[.]/g, "[.]")).join(".*") + "$").test(name));
+}
+const gated = (env, name) => Boolean(listed(env, name) || tools[name].approval);
+
+// The same JSON whatever order the keys came in, so a repeated call is recognised.
+const canon = (v) =>
+  Array.isArray(v) ? "[" + v.map(canon).join(",") + "]"
+  : v && typeof v === "object" ? "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}"
+  : JSON.stringify(v === undefined ? null : v);
+
+// runkle's inbox, a Durable Object in runkle's own Worker. The app's code never holds this binding.
+async function inbox(env, op, args) {
+  const stub = env.RUNKLE_INBOX.get(env.RUNKLE_INBOX.idFromName("inbox"));
+  return (await stub.fetch("https://inbox/", { method: "POST", body: JSON.stringify({ op, ui: env.RUNKLE_UI, ...args }) })).json();
+}
+
+// Returns nothing when the call may run, or what to tell the agent while a person decides.
+// An approval covers one call of this tool with exactly these arguments.
+async function gate(env, name, input, secrets, ctx) {
+  const tool = tools[name];
+  // A tool's own approval may be a function of the call: it returns what to show the person, or nothing to let the call through.
+  const why = typeof tool.approval === "function" ? await tool.approval(input, secrets, ctx) : tool.approval;
+  if (!why && !listed(env, name)) return;
+  if (!env.RUNKLE_INBOX) throw new Error("This call needs the user's approval, but this integration was deployed before runkle had an inbox. Ask the user to update it in runkle.");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(env.RUNKLE_APP + "\n" + name + "\n" + canon(input)));
+  const id = [...new Uint8Array(digest)].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
+  const ask = await inbox(env, "ask", { id, app: env.RUNKLE_APP, tool: name, input, summary: typeof why === "string" ? why : "" });
+  if (ask.state === "approved") return;
+  if (ask.state === "denied") throw new Error("Denied by " + ask.by + ". Do not ask again unless the user tells you to.");
+  return {
+    waiting_for_approval: env.RUNKLE_UI + "/#" + new URLSearchParams({ inbox: id }),
+    expires: new Date(ask.expires).toISOString(),
+    next:
+      "Not done: the user must approve this call first, in their runkle inbox. " +
+      (ask.notified === undefined ? "They have not decided yet. " : ask.notified ? "They have been notified. " : "Give them the link. ") +
+      "Call this tool again with exactly the same arguments: it runs once they have approved.",
+  };
 }
 
 // What every handler receives: [the app's secrets, { origin, storage, workflows }].
@@ -131,6 +181,7 @@ export default {
         webhooks: Object.keys(webhooks),
         pages: Object.keys(pages),
         workflows: Object.keys(workflows),
+        approvals: Object.keys(tools).filter((n) => gated(env, n)),
       });
     }
 
@@ -159,7 +210,7 @@ export default {
         return reply(msg.id, {
           tools: Object.entries(tools).map(([name, t]) => ({
             name,
-            description: t.description || "",
+            description: (t.description || "") + (gated(env, name) ? " May need the user's approval: the call then returns a link for them, and the same call runs once they approve." : ""),
             inputSchema: t.input || { type: "object" },
             ...(t.output && { outputSchema: t.output }),
             ...(t.annotations && { annotations: t.annotations }),
@@ -176,6 +227,8 @@ export default {
           return reply(msg.id, { content: [{ type: "text", text }], isError: true });
         }
         try {
+          const waiting = await gate(env, name, args, secrets, ctx);
+          if (waiting) return reply(msg.id, { content: [{ type: "text", text: JSON.stringify(waiting) }] });
           const out = await tools[name].run(args, secrets, ctx);
           const text = typeof out === "string" ? out : JSON.stringify(out === undefined ? null : out);
           // Agents read a plain object as structured content instead of parsing the text.

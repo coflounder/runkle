@@ -10,7 +10,7 @@ Cloudflare only.
 | MCP endpoint | Cloudflare MCP server portal | already aggregates servers, stores per-user upstream tokens, filters tools, logs calls |
 | agent sign-in | Access managed OAuth on the portal | OAuth authorization server with client registration, no code |
 | UI sign-in | Cloudflare Access in front of the Worker; Worker verifies the Access JWT with `jose` | no user table, no sessions |
-| database | none | everything runkle manages is already stored by Cloudflare; the Worker is a thin, opinionated client of the Cloudflare API |
+| database | one Durable Object, the inbox (`src/inbox.ts`) | everything runkle manages is already stored by Cloudflare; the Worker is a thin, opinionated client of the Cloudflare API. The inbox holds only what waits for a person, its decisions, and push subscriptions |
 | secrets | one Worker secret, `CLOUDFLARE_API_TOKEN` | upstream client secrets and tokens are written straight to Cloudflare and never read back |
 
 ## Where things live
@@ -35,7 +35,7 @@ Cloudflare only.
 | PUT `/api/agent-auth` | managed OAuth on/off, localhost/loopback, allowed redirect URIs | GET + PUT access app |
 | PUT `/api/portal` | code mode | PUT portal |
 | POST `/api/apps` | deploy an uploaded script as a Worker with its secrets, register it | PUT worker script, POST subdomain, then as POST `/api/integrations` |
-| PUT `/api/apps/:id` | replace a script's source and/or set secrets | PUT worker script or PUT worker secrets |
+| PUT `/api/apps/:id` | replace a script's source, set secrets, and/or set its ask-first list (UI only for the list) | PUT worker script or PUT worker secrets |
 | GET, POST `/api/apps/:id/proposal` | read an agent's proposed change to a script; approve or reject it (UI only, no MCP tool) | GET worker versions and deployments, then as PUT `/api/apps/:id` |
 | POST `/api/sources` | generate an app from an OpenAPI or Discovery document or a GraphQL endpoint, then as POST `/api/apps` | (fetches the document), then as above |
 | POST `/api/skills` | generate an app that only carries skills, then as POST `/api/apps` | as above |
@@ -130,6 +130,52 @@ keeps tokens it obtained itself in `ctx.storage`. And the review routes trust
 Access plus a same-origin `Origin` header, which separates a browser from an
 agent that behaves, not from one that holds an Access token and forges the
 header. Agents that reach runkle through the portal never hold that token.
+
+## Approvals and the inbox
+
+A tool call that needs a person is stopped in the app's own runtime
+(`gate` in `src/app-runtime.ts`), because that is the one place every call to
+an app passes through. Two things make a tool ask: the person's list, a
+`RUNKLE_ASK` plain-text binding on the app's Worker (set at creation or from
+the UI, read back from the Worker's settings), and an `approval` on the tool
+in the script, which may be a function of the call.
+
+The call then waits in runkle's inbox, one Durable Object (`Inbox` in
+`src/inbox.ts`) in runkle's own Worker. Apps reach it through a cross-script
+Durable Object binding, `RUNKLE_INBOX`, that the app's code is never handed.
+
+| step | where |
+| --- | --- |
+| the call arrives | the item's id is a SHA-256 of the app, tool name and canonical arguments, so a repeat finds the same item |
+| the person is told | the inbox sends Web Push to every browser that tapped **Notify me** (`/api/push`); the agent gets a link to the item and is told whether anyone was notified |
+| the person decides | runkle's UI, behind its Access application; `POST /api/inbox/<id>`; the decision and the Access email go to the inbox's log |
+| the call resumes | the agent repeats the call; an approved item turns to used in the same Durable Object step that answers, so it runs once |
+
+Requests and unused approvals lapse after an hour. Nothing blocks while
+waiting: holding a tool call open for minutes does not survive the portal.
+
+The other kinds of item are opened and closed by runkle itself: a proposed
+script change (closed when the review is decided, in the review screen, never
+from the inbox), secrets an agent asked for (closed when they are set), an
+integration to set up (closed when it is added), and alerts. Opening an item
+that is already open does not notify again.
+
+Push needs a VAPID key pair. The inbox makes one on first use and keeps it in
+its own storage; it is not a credential to anything, only the signature
+browsers check on runkle's notifications. A notification carries the item's
+title and kind, never a call's arguments. Subscriptions that a push service
+reports gone (404 or 410) are dropped.
+
+Not covered:
+
+- **Remote MCP servers.** The portal calls them directly, so runkle cannot
+  stop a call to one. To gate an operation, serve it from an app.
+- **Apps without secrets.** An agent can replace their code unreviewed, and
+  so rename a tool out of the list. Nothing such an app can do needs a
+  secret, and a script's own `approval` only changes with its code.
+- **Apps uploaded before the inbox** have no `RUNKLE_INBOX` binding. Their
+  gated tools refuse to run, and say so, until the app is updated in runkle.
+- **iPhone and iPad** only offer push to the app opened from the Home Screen.
 
 ## The parts that bite
 
