@@ -27,6 +27,7 @@ export const schedules = { nightly: { cron: "0 6 * * *", async run(env, ctx) {} 
 export const webhooks = { name: async (request, env, ctx) => "ok" }; // public: verify the sender's signature
 export const pages = { name: async (request, env, ctx) => "<h1>HTML</h1>" }; // behind Cloudflare Access
 export const workflows = { name: async (step, input, env, ctx) => step.do("first", async () => 1) }; // Cloudflare Workflows steps
+export const probe = async (env, ctx) => {}; // a cheap read that throws when the script's secrets or upstream do not work; run by check_integrations and runkle's daily check
 
 env holds the script's secrets. ctx.storage has get(key), put(key, value), delete(key) and list(prefix), all async and durable.
 ctx.workflows has start(name, input), which returns an id, and status(id).
@@ -67,6 +68,24 @@ function createServer(env: Env, ui: string) {
     "list_integrations",
     { description: "List every integration with its status and tools, plus the portal endpoint and agent sign-in settings.", annotations: { readOnlyHint: true } },
     () => run(() => ops.state(env, "agent")),
+  );
+  server.registerTool(
+    "check_integrations",
+    {
+      description:
+        "Check whether each integration works before you rely on it. Per integration: status ok, upstream_error, needs_sign_in, missing_secret, expiring (a secret expires within 14 days or has expired) or unused_secret, and each problem with a one-line reason and what to do. Apps are asked to run their own probe if their script exports one. Each person's own sign-ins are not visible to runkle. Changes nothing.",
+      annotations: { readOnlyHint: true },
+    },
+    () => run(() => ops.checkIntegrations(env)),
+  );
+  server.registerTool(
+    "set_secret_expiry",
+    {
+      description: "Record the day a script's or API's secret stops working, so runkle warns the user 14 days before. A date only, never a value; entering a new value for the secret clears it. list_integrations shows the dates as secret_expiry.",
+      inputSchema: { id, name: z.string().describe("Secret name as in secrets_set"), expires: z.string().nullable().describe("YYYY-MM-DD, or null to forget the date") },
+      annotations: { idempotentHint: true },
+    },
+    ({ id, ...input }) => run(() => ops.setExpiry(env, id, input)),
   );
   server.registerTool(
     "add_mcp_server",

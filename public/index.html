@@ -38,9 +38,10 @@
   <section aria-labelledby="h-int">
     <div class="bar">
       <h2 id="h-int">Integrations</h2>
-      <button class="primary" id="add">Add integration</button>
+      <div class="actions"><button id="check" title="Check every integration now. runkle also checks once a day.">Check now</button><button class="primary" id="add">Add integration</button></div>
     </div>
     <div class="card" id="integrations" aria-live="polite"><p class="row muted">Loading…</p></div>
+    <small id="checked"></small>
   </section>
 
   <section aria-labelledby="h-connect">
@@ -132,7 +133,7 @@
       <label>Script <input type="file" name="file" accept=".js,.mjs,text/javascript"></label>
       <small>One JavaScript module that exports <code>tools</code> and, if you like, skills, schedules, webhooks, pages and workflows. runkle deploys it as its own Worker. See the README for the format.</small>
       <div class="stack" data-secrets></div>
-      <small>Secrets reach the script as <code>env.NAME</code>. They are stored encrypted by Cloudflare and can be replaced but never read back, here or anywhere else.</small>
+      <small>Secrets reach the script as <code>env.NAME</code>. They are stored encrypted by Cloudflare and can be replaced but never read back, here or anywhere else. Give a secret the date it expires, if it does, and runkle warns you 14 days before.</small>
     </div>
     <div data-kind="api" class="stack" hidden>
       <label>Format
@@ -175,7 +176,7 @@
   <form id="app-form">
     <h2 id="h-app">Update script</h2>
     <label>Replace script <input type="file" name="file" accept=".js,.mjs,text/javascript"></label>
-    <small>Leave empty to keep the current script. Existing secrets and stored data are kept unless you set a secret again below. An HTTP API's credential is the secret <code>API_TOKEN</code>.</small>
+    <small>Leave empty to keep the current script. Existing secrets and stored data are kept unless you set a secret again below. An HTTP API's credential is the secret <code>API_TOKEN</code>. A new value replaces its secret's expiry date with the one beside it, or none.</small>
     <div class="stack" data-secrets></div>
     <label>Ask me first <textarea name="ask_first" rows="3" spellcheck="false" autocapitalize="off"></textarea></label>
     <small>Tool names, one per line; <code>*</code> matches anything, so <code>delete_*</code> covers every delete. An agent's call to one of these waits until you approve it in your inbox. Agents cannot change this list.</small>

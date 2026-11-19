@@ -32,6 +32,7 @@ things Cloudflare already runs for you:
   webhooks, pages and workflows (see [Scripts](#scripts)).
 - Allow or block each tool, or have it ask you first (see [Approvals](#approvals) and [Inbox](#inbox)).
 - Re-sync and remove integrations.
+- Check that every integration works, daily and on demand, and hear about problems first (see [Health](#health)).
 - Choose which agent clients may register (localhost, loopback, listed redirect URIs).
 - Turn on code mode, where agents get `search` and `execute` instead of every tool.
 - Do all of the above from an agent (see [Managing runkle from an agent](#managing-runkle-from-an-agent)).
@@ -92,7 +93,7 @@ merge: {
 },
 ```
 
-`tools` is one of six things a script can export. All are optional:
+`tools` is one of seven things a script can export. All are optional:
 
 ```js
 // Instructions agents can read through a `skills` tool.
@@ -125,6 +126,13 @@ export const workflows = {
     const ids = await step.do("list", async () => [1, 2, 3]);
     for (const id of ids) await step.do("fetch " + id, async () => ctx.storage.put("a:" + id, id));
   },
+};
+
+// A cheap call that throws when the script's secrets or the service behind it
+// do not work. runkle runs it when it checks integrations (see Health).
+export const probe = async (env, ctx) => {
+  const res = await fetch("https://example.com/me", { headers: { Authorization: "Bearer " + env.GARMIN_TOKEN } });
+  if (!res.ok) throw new Error("HTTP " + res.status);
 };
 ```
 
@@ -199,6 +207,10 @@ only answers requests that carry the portal's token.
 
 Don't paste a secret into a script's source. Use a secret field.
 
+A secret that expires can carry the date beside its value. The date is all
+runkle keeps (in its inbox); a new value takes the date entered with it, or
+none. Agents can record a date with `set_secret_expiry`, never a value.
+
 A script's code can read its secrets, so an agent cannot change a script that
 holds any. Its update waits as a proposal in your [inbox](#inbox): you read the diff and
 approve or reject it. An update that changes nothing in the code you last
@@ -238,6 +250,38 @@ tapping it opens that item. A notification names the tool or the app, never a
 call's arguments. Do the same on any computer you want to hear on. Nothing to
 configure: runkle makes its own key for signing notifications on first use and
 keeps it in its inbox.
+
+## Health
+
+runkle checks every integration once a day, and when you press **Check now**,
+so a broken one shows up before an agent fails on it. For each it reports one
+of:
+
+| status | means |
+| --- | --- |
+| `upstream_error` | the portal's last sync failed, or the app's own `probe` threw |
+| `needs_sign_in` | the portal has no working admin sign-in to an OAuth server |
+| `missing_secret` | the code reads `env.NAME` but no such secret is set |
+| `expiring` | a secret's expiry date is 14 days away or less, or has passed |
+| `unused_secret` | a secret is set that the code never reads by name |
+
+with a one-line reason and what to do. Each problem opens one inbox alert,
+which notifies once and stays open while the problem does; when the problem
+is gone the alert closes. Agents get the same report from
+`check_integrations`, which alerts no one.
+
+What runkle can see: the portal's record of each integration, the secret
+*names* on an app's Worker against the names its deployed code reads
+(`env.NAME`, `env["NAME"]`, `{ NAME } = env`; for an HTTP API, the
+credentials it was set up with), and the result of the app's `probe`. A
+script without a probe is only checked that far. An app deployed before
+health checks is not probed until it is updated in runkle once. Each person's
+own sign-in to the portal and to OAuth servers is held by Cloudflare, out of
+runkle's sight: those still only show when a call fails. The report says how
+long a portal sign-in lasts.
+
+The daily check is a Cron Trigger on runkle's own Worker (14:00 UTC). It
+counts toward your account's Cron Triggers, five on the free plan.
 
 ### Ready-made scripts
 

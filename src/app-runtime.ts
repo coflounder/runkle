@@ -11,6 +11,8 @@
 //   webhooks   public HTTP handlers at /webhooks/<name>
 //   pages      HTTP handlers at /pages/<name>, only behind Cloudflare Access
 //   workflows  durable multi-step functions, run by Cloudflare Workflows
+//   probe      an optional check that the app's secrets and upstream work,
+//              run when runkle checks integrations (/manifest/probe)
 //
 // A tool that needs a person's approval (named in RUNKLE_ASK, or carrying an
 // `approval` of its own) does not run when called. The call goes to runkle's
@@ -183,6 +185,20 @@ export default {
         workflows: Object.keys(workflows),
         approvals: Object.keys(tools).filter((n) => gated(env, n)),
       });
+    }
+
+    // runkle's health check. The key is one runkle put in its inbox for this request alone.
+    // Under /manifest, so an app whose pages sit behind Access still answers it.
+    if (path === "/manifest/probe") {
+      const key = (request.headers.get("Authorization") || "").replace(/^Bearer /, "");
+      if (!key || !env.RUNKLE_INBOX || !(await inbox(env, "probe_check", { app: env.RUNKLE_APP, key })).ok) return new Response("Unauthorized", { status: 401 });
+      if (typeof app.probe !== "function") return Response.json({ probed: false });
+      try {
+        await app.probe(secrets, ctx);
+        return Response.json({ probed: true, ok: true });
+      } catch (error) {
+        return Response.json({ probed: true, ok: false, error: String((error && error.message) || error).slice(0, 300) });
+      }
     }
 
     if (path !== "/mcp") return new Response("Not found", { status: 404 });

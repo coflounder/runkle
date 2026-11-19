@@ -10,7 +10,7 @@ Cloudflare only.
 | MCP endpoint | Cloudflare MCP server portal | already aggregates servers, stores per-user upstream tokens, filters tools, logs calls |
 | agent sign-in | Access managed OAuth on the portal | OAuth authorization server with client registration, no code |
 | UI sign-in | Cloudflare Access in front of the Worker; Worker verifies the Access JWT with `jose` | no user table, no sessions |
-| database | one Durable Object, the inbox (`src/inbox.ts`) | everything runkle manages is already stored by Cloudflare; the Worker is a thin, opinionated client of the Cloudflare API. The inbox holds only what waits for a person, its decisions, and push subscriptions |
+| database | one Durable Object, the inbox (`src/inbox.ts`) | everything runkle manages is already stored by Cloudflare; the Worker is a thin, opinionated client of the Cloudflare API. The inbox holds only what waits for a person, its decisions, push subscriptions, and what the health check needs (secret expiry dates, the last report, one-use probe keys) |
 | secrets | one Worker secret, `CLOUDFLARE_API_TOKEN` | upstream client secrets and tokens are written straight to Cloudflare and never read back |
 
 ## Where things live
@@ -39,6 +39,7 @@ Cloudflare only.
 | GET, POST `/api/apps/:id/proposal` | read an agent's proposed change to a script; approve or reject it (UI only, no MCP tool) | GET worker versions and deployments, then as PUT `/api/apps/:id` |
 | POST `/api/sources` | generate an app from an OpenAPI or Discovery document or a GraphQL endpoint, then as POST `/api/apps` | (fetches the document), then as above |
 | POST `/api/skills` | generate an app that only carries skills, then as POST `/api/apps` | as above |
+| GET, POST `/api/health` | the last health report; run the check now and update its inbox alerts | GET portal, GET access apps, per app GET worker settings, versions, deployments and its source, then the app's `/manifest/probe` |
 | POST `/mcp` | the operations above as MCP tools, minus anything that carries a secret | as above |
 
 Token permissions: `MCP Portals Write`, `Access: Apps and Policies Write`,
@@ -176,6 +177,40 @@ Not covered:
 - **Apps uploaded before the inbox** have no `RUNKLE_INBOX` binding. Their
   gated tools refuse to run, and say so, until the app is updated in runkle.
 - **iPhone and iPad** only offer push to the app opened from the Home Screen.
+
+## Health
+
+`src/health.ts` checks every integration with what runkle can see without
+anyone's token, and nothing it does changes an integration.
+
+| signal | from |
+| --- | --- |
+| last sync failed, admin sign-in missing | the portal's server record (`error_details`, `status`, `authentication_status`) |
+| missing and unused secrets | secret names in the app Worker's settings against the env names its deployed `app.js` reads. A generated API module reads its credentials by a name held in its config, so `sourceSecrets` in `src/sources.ts` answers for it |
+| expiring secrets | dates entered beside values (UI) or with `set_secret_expiry` (agents), kept per app in the inbox. A new value takes the date given with it, or none |
+| upstream works | the app's own `probe` export |
+
+runkle cannot call an app's tools: only the portal holds the app's token. So
+it asks the app to run its probe at `/manifest/probe` (under `/manifest`,
+which Access already lets through on an app with pages). The request carries
+a random key that runkle put in its inbox a moment before; the app's runtime
+checks and uses up that key through its `RUNKLE_INBOX` binding. The key
+lasts a minute and opens nothing but the probe.
+
+A Cron Trigger on runkle's Worker (`triggers.crons`, `scheduled` in
+`src/index.ts`) runs the check daily and opens one inbox `alert` per problem,
+with an id built from the integration, the kind of problem and the secret
+(`health:garmin:expiring:garmin-token`), so a standing problem stays one open
+item and notifies once. Alerts whose problem is gone are closed. The UI's
+**Check now** does the same. `check_integrations` only reports. A scheduled
+run has no request, so its notifications are signed with the address of the
+page that subscribed, kept with each subscription.
+
+Not covered: each person's own sign-in to the portal and to OAuth servers
+lives in the portal, which does not show it to the API. The report gives the
+portal's Access session duration instead. An app deployed before health
+checks answers 404 at `/manifest/probe` and is reported as not probed until
+it is updated once. HTTP API sources declare no probe.
 
 ## The parts that bite
 

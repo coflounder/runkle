@@ -164,6 +164,9 @@ async function sourceOf(env: Env, id: string, version: string): Promise<string> 
   return new TextDecoder().decode(bytes);
 }
 
+// The code serving now, not a proposal waiting for review.
+export const deployedSource = async (env: Env, id: string) => sourceOf(env, id, (await versions(env, id)).deployed);
+
 type Server = { id: string; hostname?: string } | undefined;
 
 export async function proposeApp(env: Env, server: Server, input: any, deps: Deps) {

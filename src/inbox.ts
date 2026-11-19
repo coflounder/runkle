@@ -2,6 +2,8 @@
 // the browsers to tell when something new arrives. It holds tool calls that ask
 // first, proposed script changes, secrets an agent asked for, integrations to
 // set up, and alerts. runkle's UI shows it and decides; Web Push announces it.
+// Beside that it keeps what the health check needs (src/health.ts): the dates
+// secrets expire, the last report, and one-use keys for asking an app to probe.
 // Apps reach it through a binding (RUNKLE_INBOX) their own code never sees.
 //
 // It is a plain Durable Object spoken to with fetch, so the tests can run it
@@ -92,7 +94,7 @@ export class Inbox {
 
   // Something else that waits for the person. Opening an item that is already
   // open refreshes it without notifying again.
-  async op_open({ item, ui }: { item: Pick<Item, "id" | "kind" | "title"> & Partial<Item>; ui: string }) {
+  async op_open({ item, ui }: { item: Pick<Item, "id" | "kind" | "title"> & Partial<Item>; ui?: string }) {
     const now = Date.now();
     const old = await this.item(item.id);
     const next: Item = { ...item, state: "open", created: isOpen(old, now) ? old!.created : now } as Item;
@@ -141,6 +143,44 @@ export class Inbox {
     };
   }
 
+  // ---- Integration health (src/health.ts) ----
+
+  // When an app's secrets expire, by name: days a person or an agent entered,
+  // never values. `dates` merges ({NAME: null} forgets one); `forget` drops the app.
+  async op_expiry({ app, dates, forget }: { app: string; dates?: Record<string, string | null>; forget?: boolean }) {
+    const key = `expiry:${app}`;
+    const next: Record<string, string> = forget ? {} : { ...(await this.storage.get(key)) };
+    for (const [name, date] of Object.entries(dates ?? {})) date ? (next[name] = date) : delete next[name];
+    if (dates || forget) await (Object.keys(next).length ? this.storage.put(key, next) : this.storage.delete(key));
+    return next;
+  }
+
+  async op_expiries(): Promise<Record<string, Record<string, string>>> {
+    const all = await this.storage.list({ prefix: "expiry:" });
+    return Object.fromEntries([...all].map(([key, dates]) => [key.slice("expiry:".length), dates]));
+  }
+
+  // The last full check, for runkle's UI.
+  async op_health({ report }: { report?: unknown }) {
+    if (report) await this.storage.put("health", report);
+    return (await this.storage.get("health")) ?? null;
+  }
+
+  // runkle cannot call an app's tools (only the portal holds its token), so it
+  // asks the app to run its own probe. The app checks the key here: runkle put
+  // it in for that one request, and it is gone once used or a minute old.
+  async op_probe_key({ app, key }: { app: string; key: string }) {
+    const now = Date.now();
+    for (const [old, entry] of await this.storage.list({ prefix: "probe:" })) if (entry.expires < now) await this.storage.delete(old);
+    await this.storage.put(`probe:${key}`, { app, expires: now + 60_000 });
+  }
+
+  async op_probe_check({ app, key }: { app: string; key: string }) {
+    const entry = await this.storage.get(`probe:${key}`);
+    if (entry) await this.storage.delete(`probe:${key}`);
+    return { ok: Boolean(entry && entry.app === app && entry.expires >= Date.now()) };
+  }
+
   // ---- Web Push ----
   //
   // runkle keeps no one's credentials, but it does sign its own notifications:
@@ -160,11 +200,13 @@ export class Inbox {
 
   op_key = async () => ({ publicKey: (await this.vapid()).publicKey });
 
-  async op_subscribe({ subscription, by }: { subscription: PushSubscription; by: string }) {
+  // `ui` is the page that subscribed, kept so a notification sent with no request
+  // behind it (the daily health check) can still name its sender.
+  async op_subscribe({ subscription, by, ui }: { subscription: PushSubscription; by: string; ui?: string }) {
     const endpoint = subscription?.endpoint;
     if (typeof endpoint !== "string" || !endpoint.startsWith("https://") || !subscription.keys?.p256dh || !subscription.keys?.auth)
       return { error: "Not a push subscription" };
-    await this.storage.put(`push:${await sha(endpoint)}`, { endpoint, expirationTime: null, keys: { p256dh: subscription.keys.p256dh, auth: subscription.keys.auth }, by, since: Date.now() });
+    await this.storage.put(`push:${await sha(endpoint)}`, { endpoint, expirationTime: null, keys: { p256dh: subscription.keys.p256dh, auth: subscription.keys.auth }, by, ui, since: Date.now() });
     return { subscribed: true };
   }
 
@@ -177,7 +219,7 @@ export class Inbox {
 
   // Sends to every subscribed browser and returns how many took it. A browser
   // that unsubscribed is forgotten. The notification names the item, never its arguments.
-  private async push(item: Item, ui: string): Promise<number> {
+  private async push(item: Item, ui: string | undefined): Promise<number> {
     const subs = [...(await this.storage.list({ prefix: "push:" })).entries()];
     if (!subs.length) return 0;
     const keys = await this.vapid();
@@ -188,7 +230,7 @@ export class Inbox {
     for (const [key, sub] of subs) {
       try {
         const payload = await buildPushPayload({ data, options: { ttl: item.expires ? Math.round((item.expires - Date.now()) / 1000) : 86400, urgency: "high" } }, sub, {
-          subject: ui,
+          subject: ui ?? sub.ui,
           ...keys,
         });
         const res = await fetch(sub.endpoint, payload);

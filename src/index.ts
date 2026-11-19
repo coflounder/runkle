@@ -31,7 +31,7 @@ function route(request: Request, env: Env, me: string): (() => Promise<unknown>)
   const key = `${request.method} ${pathname}`;
   const body = () => request.json().catch(() => ({})) as Promise<any>;
   const id = pathname.match(/^\/api\/(?:integrations|apps)\/([a-z0-9-]{1,32})(?:\/|$)/)?.[1];
-  const item = pathname.match(/^\/api\/inbox\/([a-z0-9:-]{1,80})$/)?.[1];
+  const item = pathname.match(/^\/api\/inbox\/([a-z0-9:-]{1,128})$/)?.[1];
 
   if (key === "GET /api/state") return () => ops.state(env, me);
   if (key === "POST /api/integrations") return async () => ops.registerServer(env, serverBody(await body()));
@@ -47,15 +47,22 @@ function route(request: Request, env: Env, me: string): (() => Promise<unknown>)
   // The inbox decides for a person, so like reviews it has no MCP tool.
   if (key === "GET /api/inbox") return () => ops.inboxList(env);
   if (item && key === `POST /api/inbox/${item}`) return async () => ops.inboxDecide(env, item, await body(), me);
-  if (key === "POST /api/push") return async () => ops.subscribe(env, await body(), me);
+  if (key === "POST /api/push") return async () => ops.subscribe(env, await body(), me, ui);
   if (key === "DELETE /api/push") return async () => ops.unsubscribe(env, await body());
   if (key === "POST /api/push/test") return () => ops.testPush(env, ui);
+  if (key === "GET /api/health") return () => ops.lastHealth(env);
+  if (key === "POST /api/health") return () => ops.checkAndAlert(env, ui);
   if (id && key === `DELETE /api/integrations/${id}`) return () => ops.removeIntegration(env, id);
   if (id && key === `POST /api/integrations/${id}/sync`) return () => ops.syncServer(env, id);
   if (id && key === `PUT /api/integrations/${id}/tools`) return async () => ops.toggleTool(env, id, await body());
 }
 
 export default {
+  // Daily (wrangler.jsonc): check every integration and alert the person about problems.
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(ops.checkAndAlert(env));
+  },
+
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const me = await signedInEmail(request, env);
     if (!me) return json({ error: "Not signed in through Cloudflare Access" }, 401);
