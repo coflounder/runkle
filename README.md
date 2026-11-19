@@ -379,6 +379,27 @@ type MCP from Fastmail's Settings > Privacy & Security > Manage API tokens.
 Adding Fastmail's MCP server to the portal directly also works, but then
 nothing asks first: the portal calls it without passing through runkle.
 
+`scripts/github.js` gives agents repositories, pull requests, merges, tags and
+workflow runs without a GitHub token of their own. It acts as a GitHub App,
+so it reaches only the repositories you install the App on. Reading and
+opening pull requests run freely. Merging into a default branch, pushing a
+tag, starting a workflow and creating a repository ask first; a merge
+approval names the commit, and the merge is refused if the branch has moved.
+
+1. Create a GitHub App (your organisation's Settings > Developer settings >
+   GitHub Apps) with no webhook and these repository permissions: Contents
+   read and write, Pull requests read and write, Actions read and write,
+   Checks read, Metadata read, and Administration read and write if it should
+   create repositories.
+2. Generate a private key for it and install it on the repositories agents
+   may touch.
+3. Upload the script with the secrets `GITHUB_APP_ID` and
+   `GITHUB_PRIVATE_KEY` (the contents of the `.pem` file).
+
+It does not push commits: an agent still needs its own way to push a branch.
+Branch protection on GitHub remains the real rule on what can be merged; the
+approval is who gets asked.
+
 ## Collections
 
 A collection is its own MCP endpoint that serves only the integrations you
