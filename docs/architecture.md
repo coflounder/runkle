@@ -10,7 +10,7 @@ Cloudflare only.
 | MCP endpoint | Cloudflare MCP server portal | already aggregates servers, stores per-user upstream tokens, filters tools, logs calls |
 | agent sign-in | Access managed OAuth on the portal | OAuth authorization server with client registration, no code |
 | UI sign-in | Cloudflare Access in front of the Worker; Worker verifies the Access JWT with `jose` | no user table, no sessions |
-| database | none | everything runkle manages is already stored by Cloudflare; the Worker is a thin, opinionated client of the Cloudflare API |
+| database | one Durable Object, the inbox (`src/inbox.ts`) | everything runkle manages is already stored by Cloudflare; the Worker is a thin, opinionated client of the Cloudflare API. The inbox holds only what waits for a person, its decisions, and push subscriptions |
 | secrets | one Worker secret, `CLOUDFLARE_API_TOKEN` | upstream client secrets and tokens are written straight to Cloudflare and never read back |
 
 ## Where things live
@@ -131,7 +131,7 @@ Access plus a same-origin `Origin` header, which separates a browser from an
 agent that behaves, not from one that holds an Access token and forges the
 header. Agents that reach runkle through the portal never hold that token.
 
-## Approvals
+## Approvals and the inbox
 
 A tool call that needs a person is stopped in the app's own runtime
 (`gate` in `src/app-runtime.ts`), because that is the one place every call to
@@ -140,19 +140,31 @@ an app passes through. Two things make a tool ask: the person's list, a
 the UI, read back from the Worker's settings), and an `approval` on the tool
 in the script, which may be a function of the call.
 
+The call then waits in runkle's inbox, one Durable Object (`Inbox` in
+`src/inbox.ts`) in runkle's own Worker. Apps reach it through a cross-script
+Durable Object binding, `RUNKLE_INBOX`, that the app's code is never handed.
+
 | step | where |
 | --- | --- |
-| the call arrives | the request is stored under the SHA-256 of tool name and canonical arguments, in a second instance of the app's Durable Object that the app's code is never handed |
-| the person is told | the runtime POSTs to `RUNKLE_NOTIFY_URL` (runkle's `NOTIFY_URL`, copied to each app as a secret on upload); the agent gets the same link |
-| the person decides | `/approvals/<id>` on the app's hostname, behind the same Access application as its pages; a same-origin form POST; the decision and the Access email are appended to a log in that Durable Object |
-| the call resumes | the agent repeats the call; an approved request is deleted as it is used, in one Durable Object step, so it runs once |
+| the call arrives | the item's id is a SHA-256 of the app, tool name and canonical arguments, so a repeat finds the same item |
+| the person is told | the inbox sends Web Push to every browser that tapped **Notify me** (`/api/push`); the agent gets a link to the item and is told whether anyone was notified |
+| the person decides | runkle's UI, behind its Access application; `POST /api/inbox/<id>`; the decision and the Access email go to the inbox's log |
+| the call resumes | the agent repeats the call; an approved item turns to used in the same Durable Object step that answers, so it runs once |
 
 Requests and unused approvals lapse after an hour. Nothing blocks while
 waiting: holding a tool call open for minutes does not survive the portal.
 
-runkle itself still stores nothing. It only passes the list and the
-notification address down, and creates the Access applications for any app
-with a gated tool.
+The other kinds of item are opened and closed by runkle itself: a proposed
+script change (closed when the review is decided, in the review screen, never
+from the inbox), secrets an agent asked for (closed when they are set), an
+integration to set up (closed when it is added), and alerts. Opening an item
+that is already open does not notify again.
+
+Push needs a VAPID key pair. The inbox makes one on first use and keeps it in
+its own storage; it is not a credential to anything, only the signature
+browsers check on runkle's notifications. A notification carries the item's
+title and kind, never a call's arguments. Subscriptions that a push service
+reports gone (404 or 410) are dropped.
 
 Not covered:
 
@@ -161,10 +173,9 @@ Not covered:
 - **Apps without secrets.** An agent can replace their code unreviewed, and
   so rename a tool out of the list. Nothing such an app can do needs a
   secret, and a script's own `approval` only changes with its code.
-- **The script's own pages** share an origin with the approval page. Their
-  code is the script's code: reviewed if the script holds secrets.
-- **Proposed script changes** keep their own review (a diff, not a call) and
-  do not expire. They notify the same address and log to the version history.
+- **Apps uploaded before the inbox** have no `RUNKLE_INBOX` binding. Their
+  gated tools refuse to run, and say so, until the app is updated in runkle.
+- **iPhone and iPad** only offer push to the app opened from the Home Screen.
 
 ## The parts that bite
 

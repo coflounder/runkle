@@ -3,6 +3,8 @@ import { UpstreamError, type Env } from "./cloudflare.ts";
 import { InputError, serverBody } from "./mapping.ts";
 import * as ops from "./ops.ts";
 
+export { Inbox } from "./inbox.ts";
+
 // Responses can describe which credentials exist; never let anything cache them.
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { "Cache-Control": "no-store" } });
 
@@ -25,22 +27,29 @@ async function signedInEmail(request: Request, env: Env): Promise<string | null>
 
 // Returns the matched handler, or undefined when no route matches.
 function route(request: Request, env: Env, me: string): (() => Promise<unknown>) | undefined {
-  const { pathname } = new URL(request.url);
+  const { pathname, origin: ui } = new URL(request.url);
   const key = `${request.method} ${pathname}`;
   const body = () => request.json().catch(() => ({})) as Promise<any>;
   const id = pathname.match(/^\/api\/(?:integrations|apps)\/([a-z0-9-]{1,32})(?:\/|$)/)?.[1];
+  const item = pathname.match(/^\/api\/inbox\/([a-z0-9:-]{1,80})$/)?.[1];
 
   if (key === "GET /api/state") return () => ops.state(env, me);
   if (key === "POST /api/integrations") return async () => ops.registerServer(env, serverBody(await body()));
-  if (key === "POST /api/apps") return async () => ops.newApp(env, await body());
-  if (key === "POST /api/sources") return async () => ops.newSource(env, await body());
-  if (key === "POST /api/skills") return async () => ops.newSkills(env, await body());
+  if (key === "POST /api/apps") return async () => ops.newApp(env, ui, await body());
+  if (key === "POST /api/sources") return async () => ops.newSource(env, ui, await body());
+  if (key === "POST /api/skills") return async () => ops.newSkills(env, ui, await body());
   if (key === "PUT /api/agent-auth") return async () => ops.setAgentAuth(env, await body());
   if (key === "PUT /api/portal") return async () => ops.setCodeMode(env, await body());
-  if (id && key === `PUT /api/apps/${id}`) return async () => ops.changeApp(env, id, await body());
+  if (id && key === `PUT /api/apps/${id}`) return async () => ops.changeApp(env, ui, id, await body());
   // Deciding on an agent's proposed change is for people only: there is no MCP tool for it.
   if (id && key === `GET /api/apps/${id}/proposal`) return () => ops.reviewChange(env, id);
-  if (id && key === `POST /api/apps/${id}/proposal`) return async () => ops.decideChange(env, id, await body(), me);
+  if (id && key === `POST /api/apps/${id}/proposal`) return async () => ops.decideChange(env, ui, id, await body(), me);
+  // The inbox decides for a person, so like reviews it has no MCP tool.
+  if (key === "GET /api/inbox") return () => ops.inboxList(env);
+  if (item && key === `POST /api/inbox/${item}`) return async () => ops.inboxDecide(env, item, await body(), me);
+  if (key === "POST /api/push") return async () => ops.subscribe(env, await body(), me);
+  if (key === "DELETE /api/push") return async () => ops.unsubscribe(env, await body());
+  if (key === "POST /api/push/test") return () => ops.testPush(env, ui);
   if (id && key === `DELETE /api/integrations/${id}`) return () => ops.removeIntegration(env, id);
   if (id && key === `POST /api/integrations/${id}/sync`) return () => ops.syncServer(env, id);
   if (id && key === `PUT /api/integrations/${id}/tools`) return async () => ops.toggleTool(env, id, await body());

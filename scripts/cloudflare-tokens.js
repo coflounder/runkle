@@ -1,5 +1,5 @@
-// Cloudflare Tokens: an agent asks for an API token, a person approves it on
-// their phone, and the value goes to a Worker secret or is shown once in the
+// Cloudflare Tokens: an agent asks for an API token, a person approves it in
+// their runkle inbox, and the value goes to a Worker secret or is shown once in the
 // person's browser. No tool ever returns a token value.
 //
 // Secrets: MINTER_TOKEN (Account API Tokens Write), ACCOUNT_ID.

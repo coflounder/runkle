@@ -6,6 +6,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Inbox } from "../src/inbox.ts";
 
 // Uploaded apps import their base classes from the Workers runtime; give Node a stand-in.
 const WORKERS = "data:text/javascript,class Base { constructor(ctx, env) { this.ctx = ctx; this.env = env; } } export { Base as DurableObject, Base as WorkflowEntrypoint };";
@@ -15,13 +16,28 @@ registerHooks({
 
 type Script = { versions: Record<string, string>[]; deployed: number; flags: string[]; modules: Record<string, string>; secrets: Record<string, string>; vars: Record<string, string>; messages: string[]; data: Map<string, unknown>; schedules: { cron: string }[]; mod?: any };
 
+// The newest fake's inbox, which the tests hand runkle as its INBOX binding.
+export let latest: { inbox: DurableObjectNamespace } | undefined;
+
 export function fakeCloudflare() {
   const servers = new Map<string, any>();
   const credentials = new Map<string, string>(); // what a real portal would send upstream
   const scripts = new Map<string, Script>();
   const workflows = new Map<string, any>();
   const runs: unknown[] = [];
-  const notes: { title: string | null; click: string | null; body: string }[] = []; // what NOTIFY_URL received
+  const pushes: { endpoint: string; ttl: string | null; vapid: string | null; bytes: number }[] = []; // what push services received
+
+  // runkle's own inbox Durable Object, shared by runkle and every app as on Cloudflare.
+  const inboxData = new Map<string, unknown>();
+  const inboxObject = new Inbox({
+    storage: {
+      get: async (k: string) => structuredClone(inboxData.get(k)),
+      put: async (k: string, v: unknown) => void inboxData.set(k, structuredClone(v)),
+      delete: async (k: string) => inboxData.delete(k),
+      list: async ({ prefix = "" } = {}) => new Map([...inboxData].filter(([k]) => k.startsWith(prefix)).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => [k, structuredClone(v)])),
+    },
+  });
+  const inbox = { idFromName: (n: string) => n, get: () => ({ fetch: (url: string, init: RequestInit) => inboxObject.fetch(new Request(url, init)) }) } as unknown as DurableObjectNamespace;
 
   // Run an uploaded app the way Workers would: its modules, its secrets, a
   // Durable Object for storage and a workflow binding that runs steps inline.
@@ -42,6 +58,7 @@ export function fakeCloudflare() {
       list: async ({ prefix = "" } = {}) => new Map([...data].filter(([k]) => k.startsWith(object + prefix)).map(([k, v]) => [k.slice(object.length), v])),
     });
     const env: any = { ...script.secrets, ...script.vars };
+    env.RUNKLE_INBOX = inbox;
     env.RUNKLE_STORE = { idFromName: (n: string) => n + "/", get: (object: string) => new mod.Store({ storage: storage(object) }, env) };
     env.RUNKLE_FLOW = {
       create: async ({ params }: any) => ({ id: String(runs.push(await new mod.Flow({}, env).run({ payload: params }, { do: (_: string, fn: () => unknown) => fn() })) - 1) }),
@@ -69,8 +86,12 @@ export function fakeCloudflare() {
   async function handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
     // A request to an app's own hostname, direct or through CF_API_BASE (see appFetch).
-    if (url.hostname === "notify.test")
-      return notes.push({ title: request.headers.get("Title"), click: request.headers.get("Click"), body: await request.text() }), new Response("ok");
+    // A browser's push service. The one at gone.push.test says its subscription has ended.
+    if (url.hostname.endsWith("push.test"))
+      return (
+        pushes.push({ endpoint: request.url, ttl: request.headers.get("TTL"), vapid: request.headers.get("Authorization"), bytes: (await request.arrayBuffer()).byteLength }),
+        new Response(null, { status: url.hostname === "gone.push.test" ? 410 : 201 })
+      );
     const [, host, rest] = url.pathname.match(/^\/__app\/([^/]+)(\/.*)$/) ?? (url.hostname.endsWith(".workers.dev") ? [, url.host, url.pathname] : []);
     if (host) {
       const { worker, env } = await app(host.split(".")[0]);
@@ -163,7 +184,8 @@ export function fakeCloudflare() {
     return fail(404, `no fake route for ${key}`);
   }
 
-  return { handle, servers, apps, portal, scripts, credentials, workflows, app, notes };
+  latest = { inbox };
+  return { handle, servers, apps, portal, scripts, credentials, workflows, app, pushes, inbox, inboxData };
 }
 
 if (import.meta.main) {

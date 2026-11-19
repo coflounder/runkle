@@ -70,3 +70,9 @@ dialog .bar { justify-content: flex-end; }
 .secret { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
 .secret input { font-family: var(--mono); font-size: 13px; }
 input[type=file] { font: inherit; }
+.item { display: grid; gap: 8px; }
+.item.flash { outline: 2px solid var(--accent); outline-offset: -2px; }
+.item pre { max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.item .actions { margin: 0; }
+#decided-wrap > summary::before { content: none; }
+#decided { margin-top: 8px; }

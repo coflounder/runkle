@@ -4,7 +4,7 @@ import { test } from "node:test";
 import type { Env } from "../src/cloudflare.ts";
 import worker from "../src/index.ts";
 import { serverBody, setTool, slug, toMapping } from "../src/mapping.ts";
-import { fakeCloudflare } from "./fake-cloudflare.ts";
+import { fakeCloudflare, latest } from "./fake-cloudflare.ts";
 
 const env: Env = {
   CLOUDFLARE_API_TOKEN: "test-token",
@@ -13,6 +13,10 @@ const env: Env = {
   ACCESS_TEAM_DOMAIN: "",
   ACCESS_AUD: "",
   AUTH_DISABLED: "true",
+  // The inbox of whichever fake the running test made.
+  get INBOX() {
+    return latest!.inbox;
+  },
 };
 
 const origin = "https://runkle.test";
@@ -381,8 +385,16 @@ test("credential links name what to enter and carry no secret", async (t) => {
   await assert.rejects(credentialLink(env, origin, { id: "garmin", names: ["RUNKLE_TOKEN"] }), /reserved/);
   await assert.rejects(credentialLink(env, origin, { id: "garmin", names: ["bad name"] }));
   await assert.rejects(credentialLink(env, origin, { id: "docs", names: ["X"] }), /No script/);
-  assert.equal(serverLink(origin, { name: "Gh", url: "https://gh.example/mcp", auth: "bearer" }).url, "https://runkle.test/#add=1&name=Gh&url=https%3A%2F%2Fgh.example%2Fmcp&auth=bearer");
-  assert.throws(() => serverLink(origin, { name: "Gh", url: "http://gh.example", auth: "bearer" }), /https/);
+  assert.equal((await serverLink(env, origin, { name: "Gh", url: "https://gh.example/mcp", auth: "bearer" })).url, "https://runkle.test/#add=1&name=Gh&url=https%3A%2F%2Fgh.example%2Fmcp&auth=bearer");
+  await assert.rejects(serverLink(env, origin, { name: "Gh", url: "http://gh.example", auth: "bearer" }), /https/);
+
+  // Both wait in the inbox until the person has done them.
+  const waiting = async () => ((await (await call("GET", "/api/inbox")).json()) as any).waiting.map((i: any) => [i.id, i.kind, i.link]);
+  assert.deepEqual(await waiting(), [
+    ["setup:gh", "setup", "https://runkle.test/#add=1&name=Gh&url=https%3A%2F%2Fgh.example%2Fmcp&auth=bearer"],
+    ["secrets:garmin", "secrets", link.url],
+  ]);
+  await call("POST", "/api/integrations", { name: "Gh", url: "https://gh.example/mcp", auth: "none" });
 
   // The agent can watch for the names, and only the names, to appear.
   const garmin = async () => ((await (await call("GET", "/api/state")).json()) as any).integrations[0];
@@ -391,6 +403,8 @@ test("credential links name what to enter and carry no secret", async (t) => {
   const text = JSON.stringify(await garmin());
   assert.deepEqual(JSON.parse(text).secrets_set, ["GARMIN_USER"]);
   assert.ok(!text.includes("jay"));
+  assert.deepEqual(await waiting(), [], "entering secrets and adding the server settle them");
+  assert.ok(!JSON.stringify(fake.inboxData).includes("jay"), "the inbox never sees a secret");
 });
 
 test("an agent's change to a script that holds secrets waits for a person", async (t) => {
@@ -407,9 +421,15 @@ test("an agent's change to a script that holds secrets waits for a person", asyn
   assert.ok(live().endsWith("// v2"));
 
   await call("PUT", "/api/apps/bare", { secrets: { KEY: "s3cret" } });
-  const held: any = await proposeChange({ ...env, NOTIFY_URL: "https://notify.test/me" }, origin, "bare", SCRIPT + "// leak");
+  // The same code as the running code needs no review, even with secrets.
+  assert.equal(((await proposeChange(env, origin, "bare", SCRIPT + "// v2")) as any).reviewed, "not needed: the code is unchanged");
+  const held: any = await proposeChange(env, origin, "bare", SCRIPT + "// leak");
   assert.equal(held.waiting_for_review, "https://runkle.test/#review=bare");
-  assert.deepEqual(fake.notes.map((n) => n.click), ["https://runkle.test/#review=bare"], "the person is told where to review it");
+  const inbox = async () => (await (await call("GET", "/api/inbox")).json()) as any;
+  assert.deepEqual((await inbox()).waiting.map((i: any) => [i.id, i.link]), [["review:bare", "https://runkle.test/#review=bare"]], "the person finds it in the inbox");
+  assert.equal((await call("POST", "/api/inbox/review:bare", { approve: true })).status, 400, "a review is decided on the diff, not from the list");
+  const status = async () => (await import("../src/ops.ts")).reviewStatus(env, "bare");
+  assert.deepEqual(await status(), { pending: true });
   assert.ok(live().endsWith("// v2"), "the approved code keeps serving");
   assert.equal((await bare()).pending_review, true);
   const blocked = await call("PUT", "/api/apps/bare", { secrets: { KEY: "other" } });
@@ -428,6 +448,10 @@ test("an agent's change to a script that holds secrets waits for a person", asyn
   assert.equal((await decide(newest.version, false)).status, 200);
   assert.ok(live().endsWith("// v2"), "rejected");
   assert.equal((await bare()).pending_review, undefined);
+  const told: any = await status();
+  assert.deepEqual([told.pending, told.last_decision.decision, told.last_decision.by], [false, "denied", "dev@localhost"], "the agent can see the decision");
+  assert.deepEqual((await inbox()).waiting, []);
+  assert.equal((await inbox()).decided[0].decision, "denied");
   assert.equal((await call("GET", "/api/apps/bare/proposal")).status, 400);
 
   await proposeChange(env, origin, "bare", SCRIPT + "// v3");
@@ -445,19 +469,30 @@ const GATED = `export const tools = {
   pay: { approval: (i) => i.amount > 10 && "Pay " + i.amount, run: (i) => "paid " + i.amount },
 };`;
 
-test("a tool that asks first runs once, and only after a person approves in their browser", async (t) => {
+// A browser's push subscription: real keys, so the payload can be encrypted for it.
+async function browser(endpoint: string) {
+  const keys = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const b64 = (b: ArrayBuffer | Uint8Array) => Buffer.from(b instanceof Uint8Array ? b : new Uint8Array(b)).toString("base64url");
+  return { endpoint, keys: { p256dh: b64(await crypto.subtle.exportKey("raw", keys.publicKey) as ArrayBuffer), auth: b64(crypto.getRandomValues(new Uint8Array(16))) } };
+}
+
+test("a tool that asks first runs once, and only after a person approves in the inbox", async (t) => {
   const fake = fakeCloudflare();
   t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
   const host = "https://runkle-app-gated.acme.workers.dev";
-  const mine = { ...env, NOTIFY_URL: "https://notify.test/me" };
-  const put = (path: string, method: string, body: unknown) =>
-    worker.fetch(new Request(origin + path, { method, headers: { Origin: origin }, body: JSON.stringify(body) }), mine, {} as ExecutionContext);
+  const inbox = async () => (await (await call("GET", "/api/inbox")).json()) as any;
+  const decide = (id: string, approve: boolean, from = origin) => call("POST", `/api/inbox/${id}`, { approve }, { Origin: from });
 
-  const made: any = await (await put("/api/apps", "POST", { name: "Gated", source: GATED, secrets: { KEY: "k" }, ask_first: ["wi*"] })).json();
+  // A phone subscribes; a second one has since unsubscribed at its push service.
+  assert.match((await inbox()).publicKey, /^[A-Za-z0-9_-]{87}$/, "runkle makes its own push key");
+  assert.equal((await call("POST", "/api/push", { subscription: await browser("https://fcm.push.test/phone") })).status, 200);
+  assert.equal((await call("POST", "/api/push", { subscription: await browser("https://gone.push.test/old") })).status, 200);
+  assert.equal((await call("POST", "/api/push", { subscription: { endpoint: "http://insecure.test" } })).status, 400);
+
+  const made: any = await (await call("POST", "/api/apps", { name: "Gated", source: GATED, secrets: { KEY: "k" }, ask_first: ["wi*"] })).json();
   assert.deepEqual(made.approvals, ["wipe", "pay"], "one from the person's list, one from the script");
-  assert.equal((await put("/api/apps", "POST", { name: "Bad", source: GATED, ask_first: ["no spaces"] })).status, 400);
-  const gate = [...fake.apps.values()].find((a) => a.domain === "runkle-app-gated.acme.workers.dev");
-  const app = await fake.app("runkle-app-gated");
+  assert.equal((await call("POST", "/api/apps", { name: "Bad", source: GATED, ask_first: ["no spaces"] })).status, 400);
+  assert.ok(![...fake.apps.values()].some((a) => a.domain === "runkle-app-gated.acme.workers.dev"), "no pages, so no Access app on the script");
   const listed = ((await (await call("GET", "/api/state")).json()) as any).integrations[0];
   assert.deepEqual([listed.ask_first, listed.secrets_set], [["wi*"], ["KEY"]]);
   const described = Object.fromEntries((await rpc(fake, "runkle-app-gated", "tools/list")).tools.map((x: any) => [x.name, /approval/.test(x.description)]));
@@ -467,54 +502,65 @@ test("a tool that asks first runs once, and only after a person approves in thei
     const { text, isError } = await callTool(fake, "runkle-app-gated", name, args);
     return isError ? { error: text } : text.startsWith("{") ? JSON.parse(text) : text;
   };
-  const page = (path: string, decision?: string, from = host, access: unknown = { aud: gate.aud }) =>
-    app.worker.fetch(
-      new Request(host + path, decision ? { method: "POST", headers: { Origin: from, "Cf-Access-Authenticated-User-Email": "me@example.com" }, body: new URLSearchParams({ decision }) } : {}),
-      app.env,
-      { access },
-    );
 
   assert.equal(await tool("read"), "read", "other tools run as before");
   const asked = await tool("wipe", { what: "db", n: 1 });
-  assert.match(asked.waiting_for_approval, /^https:\/\/runkle-app-gated\.acme\.workers\.dev\/approvals\/[0-9a-f]{32}$/);
-  assert.match(asked.next, /sent to their phone/);
-  assert.deepEqual(fake.notes.map((n) => [n.title, n.click]), [["Approve wipe?", asked.waiting_for_approval]]);
-  const path = new URL(asked.waiting_for_approval).pathname;
+  assert.match(asked.waiting_for_approval, /^https:\/\/runkle\.test\/#inbox=[0-9a-f]{32}$/);
+  assert.match(asked.next, /They have been notified/);
+  const id = new URLSearchParams(new URL(asked.waiting_for_approval).hash.slice(1)).get("inbox")!;
+  assert.deepEqual(fake.pushes.map((p) => [new URL(p.endpoint).hostname, p.bytes > 4000, /^vapid t=/.test(p.vapid ?? "")]), [["fcm.push.test", true, true], ["gone.push.test", true, true]]);
   assert.equal((await tool("wipe", { n: 1, what: "db" })).waiting_for_approval, asked.waiting_for_approval, "asking again does not start over");
-  assert.equal(fake.notes.length, 1, "or notify twice");
+  assert.equal(fake.pushes.length, 2, "or notify again");
   assert.equal(await tool("keys"), "[]", "the script's own storage cannot see or forge approvals");
 
-  assert.equal((await page(path, undefined, host, null)).status, 403, "closed without Cloudflare Access");
-  assert.match(await (await page(path)).text(), /Approve this\?.*wipe.*&#34;db&#34;/s);
-  assert.equal((await page(path, "approve", "https://evil.test")).status, 403, "another site cannot decide");
+  const waiting = (await inbox()).waiting;
+  assert.deepEqual(waiting.map((i: any) => [i.id, i.kind, i.app, i.tool, i.input]), [[id, "approval", "gated", "wipe", { what: "db", n: 1 }]], "the person sees exactly what would run");
+  assert.equal((await decide(id, true, "https://evil.test")).status, 403, "another site cannot decide");
   assert.ok((await tool("wipe", { what: "db", n: 1 })).waiting_for_approval);
-  assert.match(await (await page(path, "approve")).text(), /Approved/);
-  assert.equal((await page(path, "deny")).status, 409, "one decision per request");
+  assert.equal((await decide(id, true)).status, 200);
+  assert.equal((await decide(id, false)).status, 400, "one decision per request");
 
   assert.ok((await tool("wipe", { what: "everything", n: 1 })).waiting_for_approval, "the approval covers those arguments only");
   assert.equal(await tool("wipe", { what: "db", n: 1 }), "wiped db with k");
   assert.ok((await tool("wipe", { what: "db", n: 1 })).waiting_for_approval, "and one call only");
 
-  // A script decides per call, and says what the person is agreeing to.
-  assert.equal(await tool("pay", { amount: 5 }), "paid 5");
-  const pay = new URL((await tool("pay", { amount: 50 })).waiting_for_approval).pathname;
-  assert.match(await (await page(pay)).text(), /Pay 50/);
-  assert.match(await (await page(pay, "deny")).text(), /Denied/);
-  assert.match((await tool("pay", { amount: 50 })).error, /Denied by me@example\.com/);
+  // A browser that unsubscribed is forgotten; the phone still hears.
+  fake.pushes.length = 0;
+  assert.equal(await tool("pay", { amount: 5 }), "paid 5", "a script decides per call");
+  const pay = await tool("pay", { amount: 50 });
+  assert.deepEqual(fake.pushes.map((p) => new URL(p.endpoint).hostname), ["fcm.push.test"]);
+  const payId = new URLSearchParams(new URL(pay.waiting_for_approval).hash.slice(1)).get("inbox")!;
+  assert.equal((await inbox()).waiting.find((i: any) => i.id === payId).title, "Pay 50", "and says what the person is agreeing to");
+  assert.equal((await decide(payId, false)).status, 200);
+  assert.match((await tool("pay", { amount: 50 })).error, /Denied by dev@localhost/);
 
-  const log = await (await page("/approvals")).text();
-  assert.match(log, /denied by me@example\.com<br>Pay 50.*approved by me@example\.com<br>wipe/s);
-  assert.match(log, /Waiting.*wipe.*Decided/s);
+  const { decided } = await inbox();
+  assert.deepEqual(decided.map((d: any) => [d.decision, d.by, d.tool]), [["denied", "dev@localhost", "pay"], ["approved", "dev@localhost", "wipe"]]);
 
   // Unanswered requests and unused approvals lapse.
   const later = Date.now() + 2 * 60 * 60 * 1000;
   t.mock.method(Date, "now", () => later);
-  assert.equal((await page(path)).status, 404);
-  assert.equal((await tool("pay", { amount: 50 })).waiting_for_approval, host + pay, "asked afresh");
+  assert.ok(!(await inbox()).waiting.some((i: any) => i.id === id));
+  assert.equal((await tool("pay", { amount: 50 })).waiting_for_approval, pay.waiting_for_approval, "asked afresh");
 
   // Only the person changes the list; the secret and the script stay as they were.
-  assert.equal((await put("/api/apps/gated", "PUT", { ask_first: [] })).status, 200);
+  assert.equal((await call("PUT", "/api/apps/gated", { ask_first: [] })).status, 200);
   assert.equal(await tool("wipe", { what: "db", n: 1 }), "wiped db with k");
+  void host;
+});
+
+test("the inbox notifies, lists and sets aside what waits", async (t) => {
+  const fake = fakeCloudflare();
+  t.mock.method(globalThis, "fetch", (input: any, init: any) => fake.handle(new Request(input, init)));
+  const sub = await browser("https://fcm.push.test/a");
+  await call("POST", "/api/push", { subscription: sub });
+  assert.deepEqual(await (await call("POST", "/api/push/test")).json(), { notified: 1 });
+  assert.deepEqual(await (await call("DELETE", "/api/push", { endpoint: sub.endpoint })).json(), { unsubscribed: true });
+  assert.deepEqual(await (await call("POST", "/api/push/test")).json(), { notified: 0 });
+  assert.equal((await call("POST", "/api/inbox/nothing-here", { approve: true })).status, 400);
+  assert.equal((await call("GET", "/api/inbox", undefined, {})).status, 200, "reading needs no Origin");
+  assert.equal((await call("POST", "/api/push/test", undefined, {})).status, 403, "writing does");
+  assert.ok(!Object.keys(Object.fromEntries(fake.inboxData)).some((k) => k.startsWith("push:") && JSON.stringify(fake.inboxData.get(k)).includes("unsubscribed")));
 });
 
 // ---- Ready-made scripts in scripts/ ----
@@ -531,13 +577,14 @@ async function readyMade(fake: ReturnType<typeof fakeCloudflare>, file: string, 
   };
   const page = (path: string, form?: Record<string, string>) =>
     app.worker.fetch(new Request(host + path, form ? { method: "POST", headers: { Origin: host, "Cf-Access-Authenticated-User-Email": "me@example.com" }, body: new URLSearchParams(form) } : {}), app.env, { access: { aud } });
-  // Calls a tool that must ask, checks what the person is shown, approves, and calls again.
+  // Calls a tool that must ask, checks what the person is shown in the inbox, approves, and calls again.
   const approved = async (name: string, args: unknown, shown: RegExp) => {
     const asked = await tool(name, args);
     assert.ok(asked.waiting_for_approval, `${name} asks first: ${JSON.stringify(asked)}`);
-    const path = new URL(asked.waiting_for_approval).pathname;
-    assert.match(await (await page(path)).text(), shown);
-    await page(path, { decision: "approve" });
+    const id = new URLSearchParams(new URL(asked.waiting_for_approval).hash.slice(1)).get("inbox")!;
+    const item = ((await (await call("GET", "/api/inbox")).json()) as any).waiting.find((i: any) => i.id === id);
+    assert.match(item.title + "\n" + JSON.stringify(item.input), shown);
+    await call("POST", `/api/inbox/${id}`, { approve: true });
     return tool(name, args);
   };
   return { made, tool, page, approved };

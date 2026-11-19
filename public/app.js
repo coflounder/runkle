@@ -90,6 +90,94 @@ async function submit(e, error, close, send) {
   }
 }
 
+// ---- Inbox: what waits for you ----
+
+const KIND = { approval: "Approve a call", review: "Review a script change", secrets: "Enter secrets", setup: "Set up an integration", alert: "Alert" };
+const ago = (ms) => {
+  const m = Math.round((Date.now() - ms) / 60000);
+  return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`;
+};
+let state; // the last /api/state, so inbox links can open reviews and forms
+let publicKey; // runkle's push key
+
+function itemRow(item) {
+  const buttons = [];
+  if (item.kind === "approval") {
+    const deny = h("button", { className: "danger", textContent: "Deny" });
+    const approve = h("button", { className: "primary", textContent: "Approve" });
+    deny.onclick = () => act(deny, () => api("POST", `/api/inbox/${item.id}`, { approve: false }));
+    approve.onclick = () => act(approve, () => api("POST", `/api/inbox/${item.id}`, { approve: true }));
+    buttons.push(deny, approve);
+  } else {
+    if (item.link) {
+      const open = h("button", { className: "primary", textContent: item.kind === "review" ? "Review" : "Open" });
+      // Only the hash is taken, so the link can only open a form on this page.
+      open.onclick = () => (location.hash = new URL(item.link).hash);
+      buttons.push(open);
+    }
+    if (item.kind !== "review") {
+      const done = h("button", { textContent: "Done" });
+      done.onclick = () => act(done, () => api("POST", `/api/inbox/${item.id}`, {}));
+      buttons.push(done);
+    }
+  }
+  const when = [KIND[item.kind], item.app, ago(item.created), item.expires && `expires in ${Math.max(0, Math.ceil((item.expires - Date.now()) / 60000))} min`];
+  return h("div", { className: "row item", id: `x-${item.id}` },
+    h("div", { className: "wrap" }, h("strong", {}, item.title), h("br"), h("small", {}, when.filter(Boolean).join(" · "))),
+    item.detail ? h("p", { className: "muted wrap" }, item.detail) : null,
+    item.kind === "approval" ? h("pre", { ariaLabel: "The call that would run" }, `${item.tool} ${JSON.stringify(item.input ?? {}, null, 2)}`) : null,
+    h("div", { className: "actions" }, ...buttons));
+}
+
+async function loadInbox() {
+  const box = await api("GET", "/api/inbox");
+  publicKey = box.publicKey;
+  $("waiting").replaceChildren(...(box.waiting.length ? box.waiting.map(itemRow) : [h("p", { className: "row muted" }, "Nothing is waiting for you.")]));
+  $("decided").replaceChildren(...(box.decided.length
+    ? box.decided.map((d) => h("p", { className: "row wrap" }, h("strong", {}, `${d.decision[0].toUpperCase()}${d.decision.slice(1)}`), ` by ${d.by}: ${d.title}`, h("br"), h("small", {}, new Date(d.at).toLocaleString())))
+    : [h("p", { className: "row muted" }, "Nothing decided yet.")]));
+  document.title = box.waiting.length ? `(${box.waiting.length}) runkle` : "runkle";
+  navigator.setAppBadge?.(box.waiting.length).catch(() => {});
+}
+
+// Notifications are Web Push from runkle itself, through this page's service worker.
+async function setupNotify() {
+  const button = $("notify"), hint = $("notify-hint");
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+    // iPhone and iPad only offer push to a web app opened from the Home Screen.
+    if (/iPhone|iPad/.test(navigator.userAgent)) {
+      hint.textContent = "For notifications on this device, add runkle to your Home Screen (Share, then Add to Home Screen) and open it from there.";
+      hint.hidden = false;
+    }
+    return;
+  }
+  const worker = await navigator.serviceWorker.register("/sw.js");
+  const show = (sub) => {
+    button.textContent = sub ? "Stop notifying me" : "Notify me";
+    button.title = sub ? "This device gets a notification when something needs you." : "Get a notification on this device when something needs you.";
+    button.hidden = false;
+  };
+  const current = await worker.pushManager.getSubscription();
+  // runkle may have forgotten this device (it unsubscribed elsewhere, say): remind it.
+  if (current) await api("POST", "/api/push", { subscription: current.toJSON() }).catch(() => {});
+  show(current);
+  button.onclick = () =>
+    act(button, async () => {
+      const sub = await worker.pushManager.getSubscription();
+      if (sub) {
+        await api("DELETE", "/api/push", { endpoint: sub.endpoint });
+        await sub.unsubscribe();
+        return show(null);
+      }
+      if ((await Notification.requestPermission()) !== "granted") throw new Error("Notifications are blocked for this site. Allow them in your browser's site settings, then try again.");
+      const key = Uint8Array.from(atob(publicKey.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+      const fresh = await worker.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+      await api("POST", "/api/push", { subscription: fresh.toJSON() });
+      await api("POST", "/api/push/test");
+      show(fresh);
+    });
+}
+
 // ---- Integrations ----
 
 const STATUS = { ready: "Ready", waiting: "Waiting for sign-in", stale: "Needs sync", error: "Error" };
@@ -130,7 +218,7 @@ function integrationRow(i, open) {
       h("span", { className: `badge ${status}` }, STATUS[status] || i.status)),
     i.error ? h("p", { className: "error tools" }, i.error) : null,
     i.secrets_set?.length ? h("p", { className: "muted tools" }, `Secrets set: ${i.secrets_set.join(", ")}`) : null,
-    i.ask_first?.length ? h("p", { className: "muted tools" }, `Asks you first: ${i.ask_first.join(", ")}. `, h("a", { href: new URL("/approvals", i.url).href, target: "_blank", rel: "noopener" }, "Approvals and log")) : null,
+    i.ask_first?.length ? h("p", { className: "muted tools" }, `Asks you first: ${i.ask_first.join(", ")}. Requests wait in the inbox.`) : null,
     h("div", { className: "tools" }, ...tools),
     h("div", { className: "actions" }, review, sync, edit,
       i.auth_type === "oauth" && i.auth_mode !== "manual" ? h("a", { className: "button", href: DASHBOARD, target: "_blank", rel: "noopener", textContent: "Admin sign-in ↗" }) : null,
@@ -138,7 +226,8 @@ function integrationRow(i, open) {
 }
 
 async function load() {
-  const s = await api("GET", "/api/state");
+  const [s] = await Promise.all([api("GET", "/api/state"), loadInbox()]);
+  state = s;
   const open = new Set([...document.querySelectorAll("#integrations details[open]")].map((d) => d.id));
   $("me").textContent = `${s.portal.name} · ${s.me}`;
   $("integrations").replaceChildren(...(s.integrations.length
@@ -294,9 +383,18 @@ reviewForm.onsubmit = async (e) => {
 // A link an agent handed over (see credentialLink and serverLink in src/ops.ts)
 // opens the matching form. It can name fields but never carries a secret, and
 // everything it sets is checked here: the address bar is not a trusted source.
-function openFromLink(s) {
+function openFromLink() {
+  const s = state;
   const link = new URLSearchParams(location.hash.slice(1));
+  if (!location.hash) return;
   history.replaceState(null, "", location.pathname);
+  if (link.has("inbox")) {
+    const row = $(`x-${link.get("inbox")}`);
+    if (link.get("inbox") && !row) showError(new Error("That request is no longer waiting. It may have been decided or have expired."));
+    (row ?? $("inbox")).scrollIntoView({ block: "center" });
+    row?.classList.add("flash");
+    return;
+  }
   const target = s.integrations.find((i) => i.is_app && i.id === link.get("secrets"));
   if (target) {
     openApp(target);
@@ -318,3 +416,9 @@ load().then(openFromLink, (error) => {
   showError(error);
   $("integrations").replaceChildren(h("p", { className: "row muted" }, "Couldn't load integrations."));
 });
+// Inbox buttons and notification clicks change only the hash.
+addEventListener("hashchange", () => load().then(openFromLink, showError));
+// Keep the inbox current while the page is in view.
+setInterval(() => document.visibilityState === "visible" && loadInbox().catch(() => {}), 30000);
+document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && loadInbox().catch(() => {}));
+setupNotify().catch(showError);

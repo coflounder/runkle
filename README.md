@@ -30,7 +30,7 @@ things Cloudflare already runs for you:
 - Publish skills: written instructions agents can read (see [Skills](#skills)).
 - Upload a script and get its functions as tools, plus storage, schedules,
   webhooks, pages and workflows (see [Scripts](#scripts)).
-- Allow or block each tool, or have it ask you first (see [Approvals](#approvals)).
+- Allow or block each tool, or have it ask you first (see [Approvals](#approvals) and [Inbox](#inbox)).
 - Re-sync and remove integrations.
 - Choose which agent clients may register (localhost, loopback, listed redirect URIs).
 - Turn on code mode, where agents get `search` and `execute` instead of every tool.
@@ -200,9 +200,9 @@ only answers requests that carry the portal's token.
 Don't paste a secret into a script's source. Use a secret field.
 
 A script's code can read its secrets, so an agent cannot change a script that
-holds any. Its update waits as a proposal: the script row shows **Review
-proposed change**, where you read the diff and approve or reject it (you are
-notified of these too). Until
+holds any. Its update waits as a proposal in your [inbox](#inbox): you read the diff and
+approve or reject it. An update that changes nothing in the code you last
+approved goes out at once. Until
 then the code you last approved keeps running, and the script's secrets cannot
 be edited.
 
@@ -216,29 +216,28 @@ to main, deleting something. A tool asks first when either
   integration and never afterwards), or
 - its script says so with `approval` (see [Scripts](#scripts)).
 
-Such a call does not run. The agent gets a link instead, and you get the same
-link on your phone if a notification address is set. The page is on the
-script's own address behind Cloudflare Access; it shows the tool, its
-arguments and the script's one-line summary, with **Approve** and **Deny**.
-The agent repeats the call and it runs, once, with exactly the arguments you
-saw. A request you don't answer lapses after an hour, and so does an approval
-that is never used.
+Such a call does not run. It waits in your [inbox](#inbox), with the tool, its
+arguments and the script's one-line summary, and **Approve** and **Deny**. The
+agent gets a link to the same item and is told whether you were notified. It
+repeats the call and the call runs, once, with exactly the arguments you saw.
+A request you don't answer lapses after an hour, and so does an approval that
+is never used.
 
-Every decision is kept with who made it: open **Approvals and log** on the
-integration, or `/approvals` on the script's address. Decisions on a proposed
-script change (below) are kept in that Worker's version history.
+## Inbox
 
-To be told on your phone, set the `NOTIFY_URL` secret to an address that
-accepts a POST with the message as text and `Title` and `Click` headers. A
-topic on [ntfy](https://ntfy.sh) works as is: pick a long random topic name,
-subscribe to it in the ntfy app, and run
+Everything that waits for you lands at the top of runkle's page: calls that
+ask first, proposed script changes, secrets an agent asked you to enter, and
+integrations it asked you to set up. Each shows what to do about it; items it
+cannot settle itself (a review, a form) open where you act. **Decided** keeps
+the last 50 decisions for 30 days, with who made each one.
 
-```sh
-npx wrangler secret put NOTIFY_URL   # https://ntfy.sh/<your-topic>
-```
-
-Scripts pick the address up the next time they are uploaded or updated.
-Without it, the agent is told to give you the link.
+runkle is an installable web app. Open it on your phone and add it to the Home
+Screen (on iPhone: Share, then **Add to Home Screen**), open it from there and
+tap **Notify me**. That device then gets a notification for each new item, and
+tapping it opens that item. A notification names the tool or the app, never a
+call's arguments. Do the same on any computer you want to hear on. Nothing to
+configure: runkle makes its own key for signing notifications on first use and
+keeps it in its inbox.
 
 ### Ready-made scripts
 
