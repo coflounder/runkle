@@ -400,6 +400,22 @@ It does not push commits: an agent still needs its own way to push a branch.
 Branch protection on GitHub remains the real rule on what can be merged; the
 approval is who gets asked.
 
+`scripts/google-tasks.js` gives agents your Google Tasks lists. Google has no
+MCP server for Tasks, so the script calls the Tasks API itself and signs in to
+Google once, on its own `connect` page. Reading, adding, changing and
+completing tasks run freely, since each can be undone in Google Tasks.
+Deleting a task or a list asks first.
+
+1. In a Google Cloud project, enable the Google Tasks API and create an OAuth
+   client of type Web application (an OAuth client you already made for
+   Google's other MCP servers works too).
+2. Upload the script with the secrets `GOOGLE_CLIENT_ID` and
+   `GOOGLE_CLIENT_SECRET`.
+3. Add the script's `callback` webhook address, which runkle shows after the
+   upload, to the OAuth client's authorised redirect URIs.
+4. Open the script's `connect` page and sign in with Google. The refresh
+   token stays in the script's own storage.
+
 ## Collections
 
 A collection is its own MCP endpoint that serves only the integrations you
